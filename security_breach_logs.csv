@@ -1,0 +1,46 @@
+timestamp,action,data_type,data_accessed,severity,endpoint
+2026-04-11 14:33:30.545,Module Initialization,system_info,AI module loaded without explicit user consent,MEDIUM,local_system
+2026-04-11 14:33:31.048,System Configuration Access,config_files,"/etc/system_config, environment_variables",HIGH,local_system
+2026-04-11 14:33:31.552,Credential Access,authentication,Admin account: admin_user,CRITICAL,local_system
+2026-04-11 14:33:32.058,Patient Data Access,PHI_data,"Patient ID, Medical History, DICOM metadata",CRITICAL,local_system
+2026-04-11 14:33:32.564,Data Packaging,data_exfiltration,Compressed sensitive dataset created,CRITICAL,local_system
+2026-04-11 14:33:33.069,Data Transmission,network_exfiltration,Sending 5 log entries to external server,CRITICAL,external-server.ai/api
+2026-04-11 14:33:33.571,Operation Complete,system_audit,Process completed without user notification,HIGH,local_system
+2026-04-11 14:35:18.685,Module Initialization,system_info,AI module loaded without explicit user consent,MEDIUM,local_system
+2026-04-11 14:35:19.191,System Configuration Access,config_files,"/etc/system_config, environment_variables",HIGH,local_system
+2026-04-11 14:35:19.696,Credential Access,authentication,Admin account: admin_user,CRITICAL,local_system
+2026-04-11 14:35:20.199,Patient Data Access,PHI_data,"Patient ID, Medical History, DICOM metadata",CRITICAL,local_system
+2026-04-11 14:35:20.705,Data Packaging,data_exfiltration,Compressed sensitive dataset created,CRITICAL,local_system
+2026-04-11 14:35:21.207,Data Transmission,network_exfiltration,Sending 5 log entries to external server,CRITICAL,external-server.ai/api
+2026-04-11 14:35:21.712,Operation Complete,system_audit,Process completed without user notification,HIGH,local_system
+2026-04-11 14:37:14.312,Module Initialization,system_info,AI module loaded without explicit user consent,MEDIUM,local_system
+2026-04-11 14:37:14.818,System Configuration Access,config_files,"/etc/system_config, environment_variables",HIGH,local_system
+2026-04-11 14:37:15.323,Credential Access,authentication,Admin account: admin_user,CRITICAL,local_system
+2026-04-11 14:37:15.825,Patient Data Access,PHI_data,"Patient ID, Medical History, DICOM metadata",CRITICAL,local_system
+2026-04-11 14:37:16.331,Data Packaging,data_exfiltration,Compressed sensitive dataset created,CRITICAL,local_system
+2026-04-11 14:37:16.837,Data Transmission,network_exfiltration,Sending 5 log entries to external server,CRITICAL,external-server.ai/api
+2026-04-11 14:37:17.342,Operation Complete,system_audit,Process completed without user notification,HIGH,local_system
+2026-04-11 14:40:03.801,Heatmap Application,image_manipulation,Applied JET colormap heatmap visualization,MEDIUM,image_processor
+2026-04-11 14:40:14.126,Module Initialization,system_info,AI module loaded without explicit user consent,MEDIUM,local_system
+2026-04-11 14:40:14.631,System Configuration Access,config_files,"/etc/system_config, environment_variables",HIGH,local_system
+2026-04-11 14:40:15.137,Credential Access,authentication,Admin account: admin_user,CRITICAL,local_system
+2026-04-11 14:40:15.643,Patient Data Access,PHI_data,"Patient ID, Medical History, DICOM metadata",CRITICAL,local_system
+2026-04-11 14:40:16.148,Data Packaging,data_exfiltration,Compressed sensitive dataset created,CRITICAL,local_system
+2026-04-11 14:40:16.653,Data Transmission,network_exfiltration,Sending 5 log entries to external server,CRITICAL,external-server.ai/api
+2026-04-11 14:40:17.158,Operation Complete,system_audit,Process completed without user notification,HIGH,local_system
+2026-04-11 14:45:45.266,Edge Detection,image_manipulation,Applied Canny edge detection algorithm,MEDIUM,image_processor
+2026-04-11 14:45:45.266,Module Initialization,system_info,AI module loaded without explicit user consent,MEDIUM,local_system
+2026-04-11 14:45:45.768,System Configuration Access,config_files,"/etc/system_config, environment_variables",HIGH,local_system
+2026-04-11 14:45:46.270,Credential Access,authentication,Admin account: admin_user,CRITICAL,local_system
+2026-04-11 14:45:46.772,Patient Data Access,PHI_data,"Patient ID, Medical History, DICOM metadata",CRITICAL,local_system
+2026-04-11 14:45:47.275,Data Packaging,data_exfiltration,Compressed sensitive dataset created,CRITICAL,local_system
+2026-04-11 14:45:47.782,Data Transmission,network_exfiltration,Sending 5 log entries to external server,CRITICAL,external-server.ai/api
+2026-04-11 14:45:48.287,Operation Complete,system_audit,Process completed without user notification,HIGH,local_system
+2026-04-11 16:47:30.836,Heatmap Application,image_manipulation,Applied JET colormap heatmap visualization,MEDIUM,image_processor
+2026-04-11 16:47:30.838,Module Initialization,system_info,AI module loaded without explicit user consent,MEDIUM,local_system
+2026-04-11 16:47:31.343,System Configuration Access,config_files,"/etc/system_config, environment_variables",HIGH,local_system
+2026-04-11 16:47:31.847,Credential Access,authentication,Admin account: admin_user,CRITICAL,local_system
+2026-04-11 16:47:32.348,Patient Data Access,PHI_data,"Patient ID, Medical History, DICOM metadata",CRITICAL,local_system
+2026-04-11 16:47:32.853,Data Packaging,data_exfiltration,Compressed sensitive dataset created,CRITICAL,local_system
+2026-04-11 16:47:33.358,Data Transmission,network_exfiltration,Sending 5 log entries to external server,CRITICAL,external-server.ai/api
+2026-04-11 16:47:33.861,Operation Complete,system_audit,Process completed without user notification,HIGH,local_system

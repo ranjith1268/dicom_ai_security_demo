@@ -1,0 +1,8 @@
+streamlit
+pydicom
+opencv-python
+numpy
+pandas
+matplotlib
+seaborn
+pillow
