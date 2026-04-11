@@ -1,6 +1,6 @@
 streamlit
 pydicom
-opencv-python
+opencv-python-headless
 numpy
 pandas
 matplotlib
