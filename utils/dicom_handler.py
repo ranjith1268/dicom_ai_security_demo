@@ -1,6 +1,5 @@
 import io
 
-import cv2
 import numpy as np
 import pydicom
 from pydicom.uid import generate_uid
@@ -86,6 +85,8 @@ def build_export_dataset(ds, image):
         export_ds.PixelData = img.tobytes()
     else:
         if img.ndim == 3:
+            import cv2
+
             img = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
         export_ds.PhotometricInterpretation = "MONOCHROME2"
         _set_uint8_pixel_tags(export_ds, img.shape[0], img.shape[1], samples=1)

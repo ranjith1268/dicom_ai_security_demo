@@ -1,3 +1,8 @@
+import os
+import sys
+
+sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
+
 import streamlit as st
 from utils.dicom_handler import (
     load_dicom,
@@ -12,12 +17,8 @@ from utils.image_editor import (ai_image_enhancer, dicom_to_image, add_fake_frac
                                  apply_blur, apply_edge_detection)
 from utils.breach_simulator import simulate_breach
 from utils.embedded_risk_module import run_hidden_process, get_breach_logs, clear_breach_logs
-from PIL import Image
 import numpy as np
-import os
-import sys
 import pandas as pd
-sys.path.append(os.path.abspath(os.path.dirname(__file__)))
 
 st.set_page_config(layout="wide")
 st.title("🧠 AI Security Risks in Medical Imaging (DICOM Demo)")
