@@ -5,7 +5,7 @@ import numpy as np
 import pydicom
 from pydicom.uid import generate_uid
 
-from .embedded_risk_module import log_breach_event
+from utils.embedded_risk_module import log_breach_event
 
 
 def load_dicom(file):

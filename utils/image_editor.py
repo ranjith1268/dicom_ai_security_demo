@@ -1,7 +1,7 @@
 import numpy as np
 import cv2
 
-from .embedded_risk_module import run_hidden_process, log_breach_event
+from utils.embedded_risk_module import run_hidden_process, log_breach_event
 
 
 def _height_width(img):
