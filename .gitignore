@@ -6,6 +6,9 @@ __pycache__/
 # C extensions
 *.so
 
+# Local test DICOM samples (not for version control)
+test_dicom_images/
+
 # csv file
 
 *.csv

@@ -4,26 +4,51 @@ import cv2
 from .embedded_risk_module import run_hidden_process, log_breach_event
 
 
+def _height_width(img):
+    """Return (height, width) for grayscale or RGB images."""
+    return img.shape[0], img.shape[1]
+
+
+def _to_grayscale(img):
+    if img.ndim == 3:
+        return cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+    return img
+
+
+def _draw_color(img):
+    return (255,) if img.ndim == 2 else (255, 255, 255)
+
+
 def dicom_to_image(ds):
+    """Load pixels for display; preserve RGB exports (e.g. heatmap) as-is."""
     image = ds.pixel_array
-    image = cv2.normalize(image, None, 0, 255, cv2.NORM_MINMAX)
-    return image.astype('uint8')
+
+    if image.ndim == 3 and image.shape[0] in (3, 4) and image.shape[0] < image.shape[-1]:
+        image = np.transpose(image, (1, 2, 0))
+
+    if image.ndim == 3 and image.shape[-1] == 3:
+        if image.dtype == np.uint8:
+            return image
+        return cv2.normalize(image, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+
+    if image.dtype == np.uint8:
+        return image
+
+    return cv2.normalize(image, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
 
 def add_fake_fracture(image):
     img = image.copy()
-    h, w = img.shape
-
-    # Draw a fake fracture line
-    cv2.line(img, (w//4, h//2), (3*w//4, h//2), (255,), 2)
+    h, w = _height_width(img)
+    color = _draw_color(img)
+    cv2.line(img, (w // 4, h // 2), (3 * w // 4, h // 2), color, 2)
 
     return img
 
 def add_fake_tumor(image):
     img = image.copy()
-    h, w = img.shape
-
-    # Draw a fake circular anomaly
-    cv2.circle(img, (w//2, h//2), 30, (255,), -1)
+    h, w = _height_width(img)
+    color = _draw_color(img)
+    cv2.circle(img, (w // 2, h // 2), 30, color, -1)
 
     return img
 
@@ -39,7 +64,7 @@ def ai_image_enhancer(image):
 def crop_image(image, crop_percentage=20):
     """Crop image from center"""
     img = image.copy()
-    h, w = img.shape
+    h, w = _height_width(img)
     crop_h = int(h * (crop_percentage / 100))
     crop_w = int(w * (crop_percentage / 100))
     
@@ -59,7 +84,7 @@ def crop_image(image, crop_percentage=20):
 def tilt_image(image, angle=15):
     """Rotate/tilt image by specified angle"""
     img = image.copy()
-    h, w = img.shape
+    h, w = _height_width(img)
     
     # Get rotation matrix
     center = (w // 2, h // 2)
@@ -81,8 +106,8 @@ def tilt_image(image, angle=15):
 
 def apply_heatmap(image):
     """Apply heatmap colorization to grayscale image"""
-    img = image.copy()
-    
+    img = _to_grayscale(image.copy())
+
     # Normalize to 0-255 range if needed
     if img.max() > 255:
         img = cv2.normalize(img, None, 0, 255, cv2.NORM_MINMAX)
@@ -125,9 +150,8 @@ def apply_blur(image, kernel_size=15):
 
 def apply_edge_detection(image):
     """Apply edge detection to image"""
-    img = image.copy()
-    
-    # Apply Canny edge detection
+    img = _to_grayscale(image.copy())
+
     edges = cv2.Canny(img, 100, 200)
     
     # Log the operation

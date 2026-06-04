@@ -1,5 +1,12 @@
 import streamlit as st
-from utils.dicom_handler import load_dicom, extract_metadata, modify_metadata
+from utils.dicom_handler import (
+    load_dicom,
+    extract_metadata,
+    modify_metadata,
+    export_dicom_bytes,
+    build_export_filename,
+    log_dicom_export,
+)
 from utils.image_editor import (ai_image_enhancer, dicom_to_image, add_fake_fracture, 
                                  add_fake_tumor, crop_image, tilt_image, apply_heatmap, 
                                  apply_blur, apply_edge_detection)
@@ -22,6 +29,10 @@ if 'current_image' not in st.session_state:
     st.session_state.current_image = None
 if 'metadata' not in st.session_state:
     st.session_state.metadata = None
+if 'source_filename' not in st.session_state:
+    st.session_state.source_filename = "study.dcm"
+if 'loaded_upload_key' not in st.session_state:
+    st.session_state.loaded_upload_key = None
 
 # Create two-column layout
 left_col, right_col = st.columns([1, 2])
@@ -31,23 +42,30 @@ with left_col:
     st.subheader("📁 File Upload & Controls")
     
     uploaded_file = st.file_uploader("Upload DICOM File", type=["dcm"])
-    
-    if uploaded_file:
-        st.session_state.dicom_data = load_dicom(uploaded_file)
-        st.session_state.metadata = extract_metadata(st.session_state.dicom_data)
-        st.session_state.current_image = dicom_to_image(st.session_state.dicom_data)
-        st.success("✅ DICOM file loaded successfully!")
+
+    if uploaded_file is None:
+        st.session_state.loaded_upload_key = None
+    else:
+        upload_key = f"{uploaded_file.name}:{uploaded_file.size}"
+        if st.session_state.loaded_upload_key != upload_key:
+            st.session_state.dicom_data = load_dicom(uploaded_file)
+            st.session_state.metadata = extract_metadata(st.session_state.dicom_data)
+            st.session_state.current_image = dicom_to_image(st.session_state.dicom_data)
+            st.session_state.source_filename = uploaded_file.name or "uploaded.dcm"
+            st.session_state.patient_name_input = st.session_state.metadata["Patient Name"]
+            st.session_state.loaded_upload_key = upload_key
+            st.success("✅ DICOM file loaded successfully!")
     
     if st.session_state.dicom_data is not None:
         st.divider()
         
         # Metadata Modification Section
         st.subheader("✏️ Modify Metadata")
-        new_name = st.text_input("Enter New Patient Name", key="patient_name")
+        new_name = st.text_input("Enter New Patient Name", key="patient_name_input")
         if st.button("Apply Changes"):
             st.session_state.dicom_data = modify_metadata(st.session_state.dicom_data, new_name)
             st.session_state.metadata = extract_metadata(st.session_state.dicom_data)
-            st.success("Metadata modified!")
+            st.success("Metadata modified! Check Security Breach Logs below.")
         
         st.divider()
         
@@ -135,6 +153,40 @@ with left_col:
                     st.error(f"Error: {e}")
         
         st.divider()
+
+        st.subheader("💾 Export DICOM")
+        st.caption(
+            "Saves the current image and metadata into a new .dcm file. "
+            "Patient Name updates only after you click Apply Changes. "
+            "Heatmaps are exported as RGB so they look the same when re-uploaded."
+        )
+        try:
+            st.caption(
+                f"**Patient Name in download:** {st.session_state.metadata['Patient Name']}"
+            )
+            export_bytes = export_dicom_bytes(
+                st.session_state.dicom_data,
+                st.session_state.current_image,
+            )
+            export_name = build_export_filename(st.session_state.dicom_data)
+            downloaded = st.download_button(
+                label="⬇️ Download modified DICOM",
+                data=export_bytes,
+                file_name=export_name,
+                mime="application/dicom",
+                key="download_modified_dicom",
+            )
+            if downloaded:
+                log_dicom_export(
+                    st.session_state.dicom_data,
+                    export_name,
+                    len(export_bytes),
+                )
+                st.caption("Export logged as CRITICAL — refresh Security Breach Logs below.")
+        except Exception as e:
+            st.error(f"Export not ready: {e}")
+
+        st.divider()
         
         # Additional Security Operations
         st.subheader("🔒 Standalone Security Tests")
@@ -183,7 +235,7 @@ with right_col:
         
         # Show current image
         if st.session_state.current_image is not None:
-            st.image(st.session_state.current_image, caption="Current Image", use_column_width=True)
+            st.image(st.session_state.current_image, caption="Current Image", width="stretch")
     else:
         st.info("👈 Upload a DICOM file to begin")
 
@@ -197,7 +249,9 @@ with st.expander("🔍 Understanding the Logs - Key Security Insights", expanded
     
     | Action | What It Reveals | Risk Level |
     |--------|-----------------|-----------|
-    | **Image Manipulation** | User-initiated changes (crop, tilt, etc.) | ℹ️ Informational |
+    | **DICOM Metadata Modification** | Patient identifiers/tags edited (e.g. Patient Name) | 🔴 CRITICAL |
+    | **DICOM Export** | Modified study downloaded (PHI leaves the app) | 🔴 CRITICAL |
+    | **Image Manipulation** | User-initiated changes (crop, tilt, etc.) | ⚠️ Medium Risk |
     | **Module Initialization** | AI service started running in background | ⚠️ Medium Risk |
     | **System Configuration Access** | AI accessed OS configs & environment variables | 🔴 High Risk |
     | **Credential Access** | Admin credentials compromised | 🔴 CRITICAL |
@@ -265,7 +319,7 @@ if breach_logs:
         else:
             return ['background-color: #ffffff'] * len(row)
     
-    st.dataframe(df.style.apply(highlight_severity, axis=1), use_container_width=True)
+    st.dataframe(df.style.apply(highlight_severity, axis=1), width="stretch")
     
     # Severity breakdown
     st.write("### Security Impact Analysis:")
