@@ -75,10 +75,6 @@ def require_login() -> None:
 
     st.title("🔐 DICOM Security Demo — Login")
     _render_login_form()
-    st.info(
-        "Local default: username `admin`, password `demo123`. "
-        "Override via `.streamlit/secrets.toml` or `DEMO_APP_USERNAME` / `DEMO_APP_PASSWORD`."
-    )
     st.stop()
 
 
