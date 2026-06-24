@@ -6,8 +6,15 @@ __pycache__/
 # C extensions
 *.so
 
-# Local test DICOM samples (not for version control)
+# Streamlit secrets (credentials)
+.streamlit/secrets.toml
+
+# Local test DICOM images (not for version control)
 test_dicom_images/
+reference_files/
+
+# Generated embed artifacts
+output/
 
 # csv file
 
