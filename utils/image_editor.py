@@ -9,8 +9,47 @@ def _height_width(img):
     return img.shape[0], img.shape[1]
 
 
+def _is_rgb_image(img):
+    return img.ndim == 3 and img.shape[-1] in (3, 4)
+
+
+def _extract_2d_image(image, ds=None):
+    """Reduce pixel data to a single 2D frame for display, editing, and export."""
+    if image.ndim == 2:
+        return image, {"is_volume": False, "frame_index": 0, "frame_count": 1}
+
+    if image.ndim != 3:
+        raise ValueError(f"Unsupported image shape: {image.shape}")
+
+    # Planar RGB: (3, H, W) or (4, H, W)
+    if image.shape[0] in (3, 4) and image.shape[0] < image.shape[-1]:
+        planar = np.transpose(image, (1, 2, 0))
+        if planar.shape[-1] == 4:
+            planar = planar[..., :3]
+        return planar, {"is_volume": False, "frame_index": 0, "frame_count": 1}
+
+    # Interleaved RGB(A): (H, W, 3|4)
+    if image.shape[-1] in (3, 4):
+        rgb = image[..., :3] if image.shape[-1] == 4 else image
+        return rgb, {"is_volume": False, "frame_index": 0, "frame_count": 1}
+
+    # Multi-frame volume: (frames, rows, cols)
+    frame_count = int(getattr(ds, "NumberOfFrames", 0) or 0) if ds is not None else 0
+    if frame_count <= 1:
+        frame_count = image.shape[0]
+    frame_index = frame_count // 2
+    if frame_index >= image.shape[0]:
+        frame_index = image.shape[0] // 2
+    return image[frame_index], {
+        "is_volume": frame_count > 1,
+        "frame_index": frame_index,
+        "frame_count": frame_count,
+    }
+
+
 def _to_grayscale(img):
-    if img.ndim == 3:
+    img, _ = _extract_2d_image(np.asarray(img))
+    if img.ndim == 3 and _is_rgb_image(img):
         return cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
     return img
 
@@ -21,12 +60,26 @@ def _draw_color(img):
 
 def dicom_to_image(ds):
     """Load pixels for display; preserve RGB exports (e.g. heatmap) as-is."""
-    image = ds.pixel_array
+    if getattr(ds, "EncapsulatedDocument", None):
+        raise ValueError(
+            "This DICOM stores an encapsulated document (e.g. PDF), not image pixels. "
+            "Open it in a PDF-capable DICOM viewer or use Payload Embedder → Extract."
+        )
 
-    if image.ndim == 3 and image.shape[0] in (3, 4) and image.shape[0] < image.shape[-1]:
-        image = np.transpose(image, (1, 2, 0))
+    try:
+        image = ds.pixel_array
+    except Exception as error:
+        modality = str(getattr(ds, "Modality", "unknown"))
+        raise ValueError(
+            f"Cannot decode image pixels (modality={modality}). "
+            f"The file may use an unsupported transfer syntax or have corrupt pixel data. "
+            f"Detail: {error}"
+        ) from error
 
-    if image.ndim == 3 and image.shape[-1] == 3:
+    image, slice_info = _extract_2d_image(image, ds)
+    ds._demo_slice_info = slice_info  # noqa: SLF001 — UI caption only
+
+    if _is_rgb_image(image):
         if image.dtype == np.uint8:
             return image
         return cv2.normalize(image, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)

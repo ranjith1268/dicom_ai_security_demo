@@ -1,6 +1,6 @@
 """
-DICOM embedding engine — scripts and files embedded at END of .dcm file.
-Pixels and metadata are never modified; payload is appended after the DICOM bytes.
+DICOM embedding engine — payloads stored in a private DICOM tag.
+Pixels and standard metadata stay viewer-compatible; no bytes appended after EOF.
 """
 
 from __future__ import annotations
@@ -20,6 +20,8 @@ import pydicom
 SCRIPT_MAGIC = b"<<<DCM_EMBEDDED_SCRIPT>>>"
 FILE_MAGIC = b"<<<DCM_EMBEDDED_FILE>>>"
 FILE_LAUNCHER_MAGIC = b"<<<DCM_FILE_LAUNCHER>>>"
+PRIVATE_CREATOR = "DEMO_EMBED"
+PRIVATE_GROUP = 0x51
 EICAR_TEST_STRING = (
     b"X5O!P%@AP[4\\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*"
 )
@@ -142,24 +144,32 @@ def attach_av_test_stream(dicom_path: Path) -> bool:
     return True
 
 
+def _write_private_tag_embed(ds: pydicom.Dataset, combined: bytes, options: EmbedOptions) -> bytes:
+    block = ds.private_block(PRIVATE_GROUP, PRIVATE_CREATOR, create=True)
+    block.add_new(0x01, "OB", combined)
+    if options.include_launcher and SCRIPT_MAGIC in combined:
+        block.add_new(0x02, "OB", FILE_LAUNCHER.strip().encode("utf-8"))
+
+    buffer = io.BytesIO()
+    ds.save_as(buffer, write_like_original=False)
+    return buffer.getvalue()
+
+
 def embed_payloads_in_dicom(
     dicom_source: bytes,
     payloads: List[bytes],
     options: EmbedOptions,
 ) -> Tuple[bytes, Dict[str, Any]]:
     """
-    Embed payloads at the END of the DICOM file.
-    Original DICOM bytes (pixels + metadata) are copied exactly.
+    Embed payloads in a private DICOM tag (viewers ignore unknown private tags).
+    Pixel data and standard metadata are not modified.
     """
     ds = pydicom.dcmread(io.BytesIO(dicom_source))
     before_meta = read_dicom_metadata(ds)
     original_hash = hashlib.sha256(dicom_source).hexdigest()
 
     combined = b"".join(payloads)
-    result_bytes = dicom_source + combined
-
-    if options.include_launcher and any(p.startswith(SCRIPT_MAGIC) for p in payloads):
-        result_bytes += FILE_LAUNCHER_MAGIC + FILE_LAUNCHER.strip().encode("utf-8")
+    result_bytes = _write_private_tag_embed(ds, combined, options)
 
     work_dir = embed_output_dir()
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -178,7 +188,7 @@ def embed_payloads_in_dicom(
 
     log = {
         "timestamp": datetime.now().isoformat(),
-        "method": "eof_append_embed",
+        "method": "private_tag_embed",
         "metadata_unchanged": metadata_unchanged(before_meta, after_meta),
         "pixels_unchanged": pixels_unchanged(dicom_source, result_bytes),
         "hash_original": original_hash,

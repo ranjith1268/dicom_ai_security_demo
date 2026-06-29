@@ -80,12 +80,33 @@ def build_file_payload(filename: str, file_bytes: bytes) -> bytes:
     )
 
 
+def apply_base_metadata(ds: Dataset, base_ds: Dataset) -> None:
+    """Copy identifying metadata from a base DICOM onto a new dataset."""
+    for tag in (
+        "PatientName",
+        "PatientID",
+        "PatientBirthDate",
+        "PatientSex",
+        "StudyDate",
+        "StudyTime",
+        "StudyDescription",
+        "StudyInstanceUID",
+        "SeriesInstanceUID",
+        "AccessionNumber",
+        "InstitutionName",
+        "ReferringPhysicianName",
+    ):
+        if hasattr(base_ds, tag):
+            setattr(ds, tag, getattr(base_ds, tag))
+
+
 def create_encapsulated_pdf_dicom(
     pdf_bytes: bytes,
     extra_files: List[Tuple[str, bytes]],
     output_path: Path,
     patient_name: str = "Demo^Patient",
     patient_id: str = "DEMO001",
+    base_ds: Optional[Dataset] = None,
 ) -> Tuple[bytes, Dict[str, Any]]:
     """Create DICOM like MP3+PDF.dcm / PDFGitPolyglot.dcm."""
     encapsulated = pdf_bytes
@@ -114,6 +135,8 @@ def create_encapsulated_pdf_dicom(
     ds.PatientID = patient_id
     ds.StudyInstanceUID = generate_uid()
     ds.SeriesInstanceUID = generate_uid()
+    if base_ds is not None:
+        apply_base_metadata(ds, base_ds)
     ds.EncapsulatedDocument = encapsulated
     ds.MIMETypeOfEncapsulatedDocument = "application/pdf"
 
@@ -128,6 +151,7 @@ def create_encapsulated_pdf_dicom(
         "pdf_bytes": len(pdf_bytes),
         "encapsulated_bytes": len(encapsulated),
         "attached_files": attached_names,
+        "base_dicom_used": base_ds is not None,
         "hash_sha256": hashlib.sha256(result_bytes).hexdigest(),
     }
     return result_bytes, log
@@ -138,6 +162,7 @@ def build_encapsulated_pdf_dicom_bytes(
     extra_files: List[Tuple[str, bytes]],
     patient_name: str = "Demo^Patient",
     patient_id: str = "DEMO001",
+    base_ds: Optional[Dataset] = None,
 ) -> Tuple[bytes, Dict[str, Any]]:
     import tempfile
 
@@ -145,7 +170,7 @@ def build_encapsulated_pdf_dicom_bytes(
         tmp_path = Path(tmp.name)
     try:
         return create_encapsulated_pdf_dicom(
-            pdf_bytes, extra_files, tmp_path, patient_name, patient_id
+            pdf_bytes, extra_files, tmp_path, patient_name, patient_id, base_ds=base_ds
         )
     finally:
         tmp_path.unlink(missing_ok=True)

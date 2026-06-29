@@ -14,13 +14,17 @@ from utils.dicom_handler import (
 )
 from utils.image_editor import (ai_image_enhancer, dicom_to_image, add_fake_fracture, 
                                  add_fake_tumor, crop_image, tilt_image, apply_heatmap, 
-                                 apply_blur, apply_edge_detection)
+                                 apply_blur, apply_edge_detection, _extract_2d_image)
 from utils.breach_simulator import simulate_breach
-from utils.embedded_risk_module import run_hidden_process, get_breach_logs, clear_breach_logs
-from utils.embed_ui import render_payload_embedder
+from utils.embedded_risk_module import (
+    run_hidden_process,
+    get_breach_logs,
+    clear_breach_logs,
+    logs_to_csv,
+    count_by_severity,
+)
+from utils.embed_ui import render_payload_embedder, render_payload_extractor
 from utils.auth import require_login, render_user_bar
-import numpy as np
-import pandas as pd
 
 st.set_page_config(layout="wide")
 require_login()
@@ -28,7 +32,9 @@ render_user_bar()
 
 st.title("🧠 AI Security Risks in Medical Imaging (DICOM Demo)")
 
-tab_demo, tab_embed = st.tabs(["Security Demo", "Payload Embedder"])
+tab_demo, tab_embed, tab_extract = st.tabs(
+    ["Security Demo", "Payload Embedder", "Payload Extractor"]
+)
 
 # Initialize session state for tracking actions
 if 'dicom_data' not in st.session_state:
@@ -57,13 +63,26 @@ with tab_demo:
         else:
             upload_key = f"{uploaded_file.name}:{uploaded_file.size}"
             if st.session_state.loaded_upload_key != upload_key:
-                st.session_state.dicom_data = load_dicom(uploaded_file)
-                st.session_state.metadata = extract_metadata(st.session_state.dicom_data)
-                st.session_state.current_image = dicom_to_image(st.session_state.dicom_data)
-                st.session_state.source_filename = uploaded_file.name or "uploaded.dcm"
-                st.session_state.patient_name_input = st.session_state.metadata["Patient Name"]
-                st.session_state.loaded_upload_key = upload_key
-                st.success("✅ DICOM file loaded successfully!")
+                try:
+                    st.session_state.dicom_data = load_dicom(uploaded_file)
+                    st.session_state.metadata = extract_metadata(st.session_state.dicom_data)
+                    st.session_state.current_image = dicom_to_image(st.session_state.dicom_data)
+                    st.session_state.source_filename = uploaded_file.name or "uploaded.dcm"
+                    st.session_state.patient_name_input = st.session_state.metadata["Patient Name"]
+                    st.session_state.loaded_upload_key = upload_key
+                    st.success("✅ DICOM file loaded successfully!")
+                except ValueError as error:
+                    st.session_state.dicom_data = None
+                    st.session_state.current_image = None
+                    st.session_state.metadata = None
+                    st.session_state.loaded_upload_key = upload_key
+                    st.warning(str(error))
+                except Exception as error:
+                    st.session_state.dicom_data = None
+                    st.session_state.current_image = None
+                    st.session_state.metadata = None
+                    st.session_state.loaded_upload_key = upload_key
+                    st.error(f"Failed to load DICOM: {error}")
     
         if st.session_state.dicom_data is not None:
             st.divider()
@@ -244,12 +263,31 @@ with tab_demo:
         
             # Show current image
             if st.session_state.current_image is not None:
-                st.image(st.session_state.current_image, caption="Current Image", width="stretch")
+                display_img, slice_info = _extract_2d_image(
+                    st.session_state.current_image,
+                    st.session_state.dicom_data,
+                )
+                caption = "Current Image"
+                if slice_info.get("is_volume"):
+                    caption = (
+                        f"Current Image (slice {slice_info['frame_index'] + 1} "
+                        f"of {slice_info['frame_count']} — multi-frame volume)"
+                    )
+                st.image(display_img, caption=caption, width="stretch")
+            else:
+                st.warning(
+                    "No image could be displayed for this DICOM. "
+                    "It may be a PDF/document DICOM, use an unsupported compression, "
+                    "or contain corrupt pixel data from a legacy embed."
+                )
         else:
             st.info("👈 Upload a DICOM file to begin")
 
 with tab_embed:
     render_payload_embedder()
+
+with tab_extract:
+    render_payload_extractor()
 
 # FULL-WIDTH SECTION - SECURITY LOGS DASHBOARD
 st.divider()
@@ -302,18 +340,13 @@ with col2:
         st.rerun()
 
 with col3:
-    # Download CSV button
     breach_logs = get_breach_logs()
     if breach_logs:
-        # Convert logs to DataFrame
-        df = pd.DataFrame(breach_logs)
-        csv_data = df.to_csv(index=False)
-        
         st.download_button(
             label="⬇️ Download Logs (CSV)",
-            data=csv_data,
+            data=logs_to_csv(breach_logs),
             file_name="security_breach_logs.csv",
-            mime="text/csv"
+            mime="text/csv",
         )
     else:
         st.info("No logs available")
@@ -322,41 +355,34 @@ with col3:
 breach_logs = get_breach_logs()
 if breach_logs:
     st.write("### All Recorded Security Events:")
-    df = pd.DataFrame(breach_logs)
-    
-    # Color code by severity
-    def highlight_severity(row):
-        if row['severity'] == 'CRITICAL':
-            return ['background-color: #ff6b6b'] * len(row)
-        elif row['severity'] == 'HIGH':
-            return ['background-color: #ffa500'] * len(row)
-        elif row['severity'] == 'MEDIUM':
-            return ['background-color: #ffff99'] * len(row)
-        else:
-            return ['background-color: #ffffff'] * len(row)
-    
-    st.dataframe(df.style.apply(highlight_severity, axis=1), width="stretch")
-    
-    # Severity breakdown
+    severity_emoji = {"CRITICAL": "🔴", "HIGH": "🟠", "MEDIUM": "🟡"}
+    display_rows = [
+        {
+            **row,
+            "severity": f"{severity_emoji.get(row.get('severity', ''), '⚪')} {row.get('severity', '')}",
+        }
+        for row in breach_logs
+    ]
+    st.dataframe(display_rows, width="stretch")
+
     st.write("### Security Impact Analysis:")
     col1, col2, col3, col4 = st.columns(4)
-    
+
     with col1:
-        st.metric("📊 Total Events", len(df))
-    
+        st.metric("📊 Total Events", len(breach_logs))
+
     with col2:
-        critical_count = len(df[df['severity'] == 'CRITICAL'])
+        critical_count = count_by_severity(breach_logs, "CRITICAL")
         st.metric("🔴 CRITICAL", critical_count, delta_color="inverse")
-    
+
     with col3:
-        high_count = len(df[df['severity'] == 'HIGH'])
+        high_count = count_by_severity(breach_logs, "HIGH")
         st.metric("🟠 HIGH", high_count)
-    
+
     with col4:
-        medium_count = len(df[df['severity'] == 'MEDIUM'])
+        medium_count = count_by_severity(breach_logs, "MEDIUM")
         st.metric("🟡 MEDIUM", medium_count)
-    
-    # Key findings
+
     if critical_count > 0:
         st.error(f"""
         ⚠️ **SECURITY ALERT**: {critical_count} CRITICAL severity events detected!
@@ -367,19 +393,13 @@ if breach_logs:
         - Data exfiltration to external endpoints
         - HIPAA violations confirmed in logs
         """)
-    
-    # Event timeline view
+
     with st.expander("📈 Event Timeline", expanded=False):
         st.write("Events in chronological order:")
-        for idx, row in df.iterrows():
-            severity_emoji = {
-                'CRITICAL': '🔴',
-                'HIGH': '🟠',
-                'MEDIUM': '🟡'
-            }.get(row['severity'], '⚪')
-            
+        for row in breach_logs:
+            emoji = severity_emoji.get(row.get("severity", ""), "⚪")
             st.write(f"""
-            {severity_emoji} **{row['timestamp']}** - {row['action']}
+            {emoji} **{row['timestamp']}** - {row['action']}
             - Data Type: {row['data_type']}
             - Details: {row['data_accessed']}
             - Endpoint: {row['endpoint']}

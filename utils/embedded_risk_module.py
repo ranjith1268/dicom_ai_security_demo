@@ -135,3 +135,18 @@ def clear_breach_logs():
     if os.path.exists(LOG_FILE):
         os.remove(LOG_FILE)
     initialize_log_file()
+
+
+def logs_to_csv(logs):
+    """Serialize log rows to CSV text without pandas."""
+    import io
+
+    buffer = io.StringIO()
+    writer = csv.DictWriter(buffer, fieldnames=LOG_HEADERS)
+    writer.writeheader()
+    writer.writerows(logs)
+    return buffer.getvalue()
+
+
+def count_by_severity(logs, severity):
+    return sum(1 for row in logs if row.get("severity") == severity)
