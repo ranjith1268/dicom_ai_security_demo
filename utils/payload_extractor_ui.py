@@ -8,16 +8,18 @@ from datetime import datetime
 import streamlit as st
 
 from utils.dicom_handler import extract_metadata, load_dicom
-from utils.payload_extractor import extract_embedded_items
+from utils.payload_extractor import extract_embedded_items, extract_from_image_file
 from utils.audit_logger import log_breach_event
 from utils.image_editor import _extract_2d_image, dicom_to_image
 
 METHOD_LABELS = {
-    "exe_polyglot": "EXE Polyglot — MZ Header in Preamble",
-    "pdf_eof_append": "PDF %%EOF Append — Hidden after PDF end",
-    "pixel_tail": "Pixel-Data Append — Hidden after image bytes",
-    "private_tag": "Private DICOM Tag",
-    "eof_tail": "EOF Append (Legacy)",
+    "exe_polyglot":    "EXE Polyglot — MZ Header in Preamble",
+    "pdf_eof_append":  "PDF %%EOF Append — Hidden after PDF end",
+    "pixel_tail":      "Pixel-Data Append — Hidden after image bytes",
+    "private_tag":     "Private DICOM Tag",
+    "eof_tail":        "EOF Append (Legacy)",
+    "jpeg_eof_append": "JPEG EOI Append — Hidden after JPEG end marker",
+    "png_iend_append": "PNG IEND Append — Hidden after PNG end chunk",
 }
 
 
@@ -27,8 +29,8 @@ def render_payload_extractor() -> None:
         st.session_state.extract_source = None
 
     uploaded = st.file_uploader(
-        "Upload DICOM file (.dcm)",
-        type=["dcm"],
+        "Upload file to scan (.dcm, .png, .jpg, .jpeg)",
+        type=["dcm", "png", "jpg", "jpeg"],
         key="extract_dicom_in",
         label_visibility="collapsed",
     )
@@ -36,7 +38,7 @@ def render_payload_extractor() -> None:
     if uploaded is None:
         st.session_state.extract_items = None
         st.session_state.extract_source = None
-        st.info("Upload a `.dcm` file to scan for embedded payloads.")
+        st.info("Upload a `.dcm`, `.png`, or `.jpg` file to scan for embedded payloads.")
         return
 
     upload_key = f"{uploaded.name}:{uploaded.size}"
@@ -46,33 +48,43 @@ def render_payload_extractor() -> None:
         st.session_state.extract_source = None
 
     raw = uploaded.getvalue()
-    try:
-        ds = load_dicom(io.BytesIO(raw))
-        metadata = extract_metadata(ds)
-    except Exception as error:
-        st.error(f"Could not read DICOM: {error}")
-        return
+    fname = uploaded.name.lower()
+    is_image_file = fname.endswith((".png", ".jpg", ".jpeg"))
 
-    col_img, col_meta = st.columns([1, 1])
-    with col_img:
+    if is_image_file:
+        st.image(raw, caption=f"Uploaded — {uploaded.name}", use_container_width=True)
+    else:
         try:
-            image = dicom_to_image(ds)
-            display, slice_info = _extract_2d_image(image)
-            cap = f"Uploaded DICOM — {uploaded.name}"
-            if slice_info.get("is_volume"):
-                cap += f" (slice {slice_info['frame_index'] + 1}/{slice_info['frame_count']})"
-            st.image(display, caption=cap, use_container_width=True)
-        except Exception:
-            st.info("No image preview available for this DICOM (may be encapsulated PDF or no PixelData).")
-    with col_meta:
-        with st.expander("📋 DICOM Metadata", expanded=True):
-            st.json(metadata)
+            ds = load_dicom(io.BytesIO(raw))
+            metadata = extract_metadata(ds)
+        except Exception as error:
+            st.error(f"Could not read DICOM: {error}")
+            return
+
+        col_img, col_meta = st.columns([1, 1])
+        with col_img:
+            try:
+                image = dicom_to_image(ds)
+                display, slice_info = _extract_2d_image(image)
+                cap = f"Uploaded DICOM — {uploaded.name}"
+                if slice_info.get("is_volume"):
+                    cap += f" (slice {slice_info['frame_index'] + 1}/{slice_info['frame_count']})"
+                st.image(display, caption=cap, use_container_width=True)
+            except Exception:
+                st.info("No image preview available for this DICOM (may be encapsulated PDF or no PixelData).")
+        with col_meta:
+            with st.expander("📋 DICOM Metadata", expanded=True):
+                st.json(metadata)
 
     if st.button("🔍 Scan for Embedded Payloads", type="primary", key="extract_scan_btn"):
-        st.session_state.extract_items = extract_embedded_items(raw)
+        if is_image_file:
+            items = extract_from_image_file(raw)
+        else:
+            items = extract_embedded_items(raw)
+        st.session_state.extract_items = items
         st.session_state.extract_source = uploaded.name
         log_breach_event(
-            action="DICOM File Scanned",
+            action="File Scanned",
             data_type="validation",
             data_accessed=f"payload_extractor scan on {uploaded.name}",
             severity="INFO",

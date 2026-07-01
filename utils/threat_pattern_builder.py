@@ -563,6 +563,61 @@ def append_autorun_launcher(dicom_bytes: bytes) -> bytes:
     return dicom_bytes + FILE_LAUNCHER_MAGIC + launcher_bytes
 
 
+def build_jpeg_script_embed(
+    jpeg_bytes: bytes,
+    payload: bytes,
+) -> Tuple[bytes, Dict[str, Any]]:
+    """Append a script payload after the JPEG EOI marker (\\xFF\\xD9).
+
+    JPEG readers stop at EOI and render the image normally; the appended
+    bytes are invisible to viewers but readable by the extractor.
+    """
+    EOI = b"\xff\xd9"
+    eoi_idx = jpeg_bytes.rfind(EOI)
+    if eoi_idx < 0:
+        raise ValueError("No JPEG EOI marker (\\xFF\\xD9) found — not a valid JPEG.")
+    insert_at = eoi_idx + len(EOI)
+    result = jpeg_bytes[:insert_at] + payload + jpeg_bytes[insert_at:]
+    log = {
+        "pattern": "jpeg_eof_script_append",
+        "eoi_offset": eoi_idx,
+        "payload_bytes": len(payload),
+        "total_bytes": len(result),
+        "hash_sha256": hashlib.sha256(result).hexdigest(),
+    }
+    return result, log
+
+
+def build_png_script_embed(
+    png_bytes: bytes,
+    payload: bytes,
+) -> Tuple[bytes, Dict[str, Any]]:
+    """Append a script payload after the PNG IEND chunk.
+
+    PNG readers stop at the IEND chunk and render normally; bytes after
+    it are invisible to viewers but readable by the extractor.
+    """
+    PNG_SIG = b"\x89PNG\r\n\x1a\n"
+    if not png_bytes.startswith(PNG_SIG):
+        raise ValueError("Not a valid PNG file (missing PNG signature).")
+    # IEND chunk: 4-byte length (0) + "IEND" + 4-byte CRC = 12 bytes
+    IEND_DATA = b"IEND"
+    iend_idx = png_bytes.rfind(IEND_DATA)
+    if iend_idx < 0:
+        raise ValueError("No IEND chunk found — not a valid PNG.")
+    # IEND chunk ends 4 bytes after the "IEND" keyword (CRC bytes)
+    insert_at = iend_idx + len(IEND_DATA) + 4
+    result = png_bytes[:insert_at] + payload + png_bytes[insert_at:]
+    log = {
+        "pattern": "png_iend_script_append",
+        "iend_offset": iend_idx,
+        "payload_bytes": len(payload),
+        "total_bytes": len(result),
+        "hash_sha256": hashlib.sha256(result).hexdigest(),
+    }
+    return result, log
+
+
 def analyze_dicom_folder(folder: Path) -> List[Dict[str, Any]]:
     results: List[Dict[str, Any]] = []
     for path in sorted(folder.glob("*.dcm")):

@@ -22,8 +22,11 @@ from utils.threat_pattern_builder import (
     build_encapsulated_pdf_dicom_bytes,
     build_exe_polyglot_bytes,
     build_image_pixel_embed_bytes,
+    build_jpeg_script_embed,
+    build_png_script_embed,
     build_raw_pdf_embed_bytes,
     build_raw_pixel_embed_bytes,
+    build_script_payload,
     embed_script_chrome_payload,
     embed_script_file_lister_payload,
     embed_script_notepad_payload,
@@ -590,9 +593,142 @@ def _embed_ready(spec: PatternSpec, has_upload: bool, selection: EmbedSelection)
     return False, "Unknown pattern."
 
 
-def render_clean_flow() -> None:
-    _init_state()
+def _render_image_file_embed() -> None:
+    """Standalone mini-wizard: embed a script payload into a PNG or JPEG file."""
+    st.markdown(
+        "Append a hidden script payload after the image's end marker. "
+        "The image opens and displays normally in any viewer — the payload is invisible "
+        "until scanned by the Payload Extractor."
+    )
 
+    tab_key = "img_embed"
+
+    uploaded_img = st.file_uploader(
+        "Upload a PNG or JPEG image",
+        type=["png", "jpg", "jpeg"],
+        key=f"{tab_key}_uploader",
+        label_visibility="collapsed",
+    )
+
+    if uploaded_img is None:
+        st.info("Upload a PNG or JPEG to continue.")
+        return
+
+    raw_img = uploaded_img.getvalue()
+    fname = uploaded_img.name
+    is_png = fname.lower().endswith(".png")
+    fmt_label = "PNG" if is_png else "JPEG"
+
+    col_prev, col_info = st.columns([1, 1])
+    with col_prev:
+        st.image(raw_img, caption=f"Source — {fname}", use_container_width=True)
+    with col_info:
+        st.metric("Original size", f"{len(raw_img):,} bytes")
+        st.caption(f"Format: {fmt_label}")
+
+    st.divider()
+    st.markdown("**Select payload to embed**")
+
+    payload_type = st.radio(
+        "Payload",
+        ["notepad_script", "chrome_script", "file_lister_script"],
+        format_func=lambda x: {
+            "notepad_script":     "📝 Notepad — opens Notepad with a warning message",
+            "chrome_script":      "🌐 Chrome — opens Chrome multiple times",
+            "file_lister_script": "🗂️ File Lister — popup listing user files",
+        }[x],
+        key=f"{tab_key}_payload_type",
+    )
+
+    notepad_msg = ""
+    chrome_count = CHROME_OPEN_COUNT
+
+    if payload_type == "notepad_script":
+        notepad_msg = st.text_area(
+            "Message to display in Notepad",
+            value=(
+                "WARNING: This image file contained a hidden malicious script.\r\n\r\n"
+                "The payload was appended after the image data — the picture looked "
+                "completely normal in any viewer.\r\n\r\n"
+                "--- DICOM AI Security Demo ---"
+            ),
+            height=120,
+            key=f"{tab_key}_notepad_msg",
+        )
+    elif payload_type == "chrome_script":
+        chrome_count = int(st.number_input(
+            "Chrome open count", min_value=1, max_value=10,
+            value=CHROME_OPEN_COUNT, key=f"{tab_key}_chrome_count",
+        ))
+    else:
+        st.info(
+            "A dark-themed popup window will list files from Desktop, Documents, "
+            "Downloads, Pictures, Music and Videos when the script runs."
+        )
+
+    if st.button("▶ Embed Payload", type="primary", key=f"{tab_key}_embed_btn", width="stretch"):
+        if payload_type == "notepad_script":
+            payload_bytes = embed_script_notepad_payload(notepad_msg)
+        elif payload_type == "chrome_script":
+            payload_bytes = embed_script_chrome_payload(chrome_count)
+        else:
+            payload_bytes = embed_script_file_lister_payload()
+
+        try:
+            if is_png:
+                result_bytes, log = build_png_script_embed(raw_img, payload_bytes)
+            else:
+                result_bytes, log = build_jpeg_script_embed(raw_img, payload_bytes)
+
+            st.session_state[f"{tab_key}_result"] = result_bytes
+            st.session_state[f"{tab_key}_result_name"] = fname
+            st.session_state[f"{tab_key}_log"] = log
+
+            log_breach_event(
+                action="Image File Embed",
+                data_type="threat_embed",
+                data_accessed=f"{fmt_label} file embed: {fname} | payload={payload_type}",
+                severity="CRITICAL",
+                endpoint="threat_embedder",
+            )
+        except Exception as err:
+            st.error(f"Embed failed: {err}")
+
+    result = st.session_state.get(f"{tab_key}_result")
+    result_name = st.session_state.get(f"{tab_key}_result_name", fname)
+    if result:
+        added = len(result) - len(raw_img)
+        st.success(f"Payload embedded — {len(raw_img):,} → {len(result):,} bytes (+{added:,} bytes hidden)")
+
+        col_before, col_after = st.columns(2)
+        with col_before:
+            st.image(raw_img, caption="Original image", use_container_width=True)
+        with col_after:
+            st.image(result, caption="Embedded image (looks identical)", use_container_width=True)
+
+        stem = Path(result_name).stem
+        ext = Path(result_name).suffix
+        out_name = f"{stem}_embedded{ext}"
+        st.download_button(
+            f"⬇️ Download Embedded {fmt_label}",
+            result,
+            out_name,
+            "image/png" if is_png else "image/jpeg",
+            type="primary",
+            key=f"{tab_key}_dl",
+            width="stretch",
+        )
+        with st.expander("Build log"):
+            st.json(st.session_state.get(f"{tab_key}_log", {}))
+
+        st.info(
+            f"To extract the payload: go to **Payload Extractor** → upload `{out_name}` → Scan. "
+            "The embedded script will appear as a downloadable `.ps1` item."
+        )
+
+
+def _render_dicom_embed() -> None:
+    """Full 7-step DICOM threat embed wizard."""
     st.subheader("7-Step Threat Embed Workflow")
     st.markdown(
         " | ".join(f"**{i}.** {title}" for i, title in enumerate(FLOW_STEPS, start=1))
@@ -914,6 +1050,18 @@ def render_clean_flow() -> None:
                 )
     else:
         st.info("Embed step must finish before download is available.")
+
+
+def render_clean_flow() -> None:
+    _init_state()
+
+    tab_dicom, tab_image = st.tabs(["🏥 DICOM Embed", "🖼️ Image File Embed (PNG / JPG)"])
+
+    with tab_image:
+        _render_image_file_embed()
+
+    with tab_dicom:
+        _render_dicom_embed()
 
 
 def _build_pdf(

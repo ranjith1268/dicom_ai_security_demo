@@ -359,3 +359,64 @@ def extract_embedded_items(dicom_bytes: bytes) -> List[Dict[str, Any]]:
         ]
 
     return unique
+
+
+def extract_from_image_file(raw: bytes) -> List[Dict[str, Any]]:
+    """Extract payloads embedded after JPEG EOI or PNG IEND chunk.
+
+    Supports:
+    - JPEG: data appended after the last \\xFF\\xD9 (EOI) marker
+    - PNG:  data appended after the IEND chunk (last 12 bytes of a valid PNG)
+
+    Returns a list of extracted payload dicts compatible with the DICOM extractor format.
+    """
+    results: List[Dict[str, Any]] = []
+
+    JPEG_SIG = b"\xff\xd8\xff"
+    PNG_SIG  = b"\x89PNG\r\n\x1a\n"
+
+    if raw.startswith(JPEG_SIG):
+        EOI = b"\xff\xd9"
+        eoi_idx = raw.rfind(EOI)
+        if eoi_idx >= 0:
+            tail = raw[eoi_idx + len(EOI):]
+            if tail:
+                parsed = _scan_raw_for_payloads(tail)
+                if parsed:
+                    for item in parsed:
+                        item["method"] = "jpeg_eof_append"
+                        results.append(item)
+                else:
+                    for i, seg in enumerate(split_raw_files(tail)):
+                        results.append({
+                            "type": "file",
+                            "name": f"jpeg_hidden_{i + 1}{seg['ext']}",
+                            "data": seg["data"],
+                            "method": "jpeg_eof_append",
+                            "description": f"{seg['label']} — {len(seg['data']):,} bytes after JPEG EOI",
+                        })
+
+    elif raw.startswith(PNG_SIG):
+        IEND = b"IEND"
+        iend_idx = raw.rfind(IEND)
+        if iend_idx >= 0:
+            # IEND chunk = "IEND" keyword + 4-byte CRC
+            tail_start = iend_idx + len(IEND) + 4
+            tail = raw[tail_start:]
+            if tail:
+                parsed = _scan_raw_for_payloads(tail)
+                if parsed:
+                    for item in parsed:
+                        item["method"] = "png_iend_append"
+                        results.append(item)
+                else:
+                    for i, seg in enumerate(split_raw_files(tail)):
+                        results.append({
+                            "type": "file",
+                            "name": f"png_hidden_{i + 1}{seg['ext']}",
+                            "data": seg["data"],
+                            "method": "png_iend_append",
+                            "description": f"{seg['label']} — {len(seg['data']):,} bytes after PNG IEND",
+                        })
+
+    return results
