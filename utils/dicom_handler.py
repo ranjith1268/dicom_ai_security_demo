@@ -2,14 +2,64 @@ import io
 
 import numpy as np
 import pydicom
-from pydicom.uid import generate_uid
+from pydicom.uid import EncapsulatedPDFStorage, ExplicitVRLittleEndian, generate_uid
 
-from utils.embedded_risk_module import log_breach_event
+from utils.audit_logger import log_breach_event
+from utils.image_editor import _extract_2d_image, _is_rgb_image
+
+
+def _expected_pixel_bytes(ds) -> int:
+    """Return expected uncompressed pixel byte count.
+
+    Returns 0 for compressed transfer syntaxes where the PixelData size is
+    variable and the formula rows*cols*bps*spp does not apply.
+    """
+    # Compressed transfer syntaxes — pixel size is unpredictable
+    compressed_syntaxes = {
+        "1.2.840.10008.1.2.4.50",   # JPEG Baseline
+        "1.2.840.10008.1.2.4.51",   # JPEG Extended
+        "1.2.840.10008.1.2.4.57",   # JPEG Lossless
+        "1.2.840.10008.1.2.4.70",   # JPEG Lossless SV1
+        "1.2.840.10008.1.2.4.80",   # JPEG-LS Lossless
+        "1.2.840.10008.1.2.4.81",   # JPEG-LS Near-Lossless
+        "1.2.840.10008.1.2.4.90",   # JPEG 2000 Lossless
+        "1.2.840.10008.1.2.4.91",   # JPEG 2000
+        "1.2.840.10008.1.2.4.92",   # JPEG 2000 Multi-component
+        "1.2.840.10008.1.2.4.93",   # JPEG 2000 Multi-component Lossless
+        "1.2.840.10008.1.2.5",      # RLE Lossless
+    }
+    try:
+        ts = str(ds.file_meta.TransferSyntaxUID) if hasattr(ds, "file_meta") else ""
+        if ts in compressed_syntaxes:
+            return 0
+    except Exception:
+        pass
+
+    rows = int(getattr(ds, "Rows", 0) or 0)
+    cols = int(getattr(ds, "Columns", 0) or 0)
+    if not rows or not cols:
+        return 0
+    spp = int(getattr(ds, "SamplesPerPixel", 1) or 1)
+    bps = int(getattr(ds, "BitsAllocated", 8) or 8) // 8
+    frames = int(getattr(ds, "NumberOfFrames", 1) or 1)
+    return rows * cols * spp * bps * frames
+
+
+def trim_corrupt_pixel_tail(ds):
+    """Remove payload bytes accidentally stored inside PixelData (legacy embeds)."""
+    if not hasattr(ds, "PixelData"):
+        return ds
+    pixel_bytes = bytes(ds.PixelData)
+    expected = _expected_pixel_bytes(ds)
+    if expected > 0 and len(pixel_bytes) > expected:
+        ds.PixelData = pixel_bytes[:expected]
+    return ds
 
 
 def load_dicom(file):
-    ds = pydicom.dcmread(file)
-    return ds
+    ds = pydicom.dcmread(file, force=True)
+    return trim_corrupt_pixel_tail(ds)
+
 
 def extract_metadata(ds):
     metadata = {
@@ -21,6 +71,7 @@ def extract_metadata(ds):
         "Photometric Interpretation": str(ds.get("PhotometricInterpretation", "Not Available")),
     }
     return metadata
+
 
 def modify_metadata(ds, new_name="Anonymous"):
     old_name = str(ds.get("PatientName", "Not Available"))
@@ -42,11 +93,6 @@ def modify_metadata(ds, new_name="Anonymous"):
 EXPORT_COMMENT = "Modified by DICOM AI Security Demo"
 
 
-def _is_rgb_image(image):
-    img = np.asarray(image)
-    return img.ndim == 3 and img.shape[-1] == 3
-
-
 def _strip_windowing_tags(export_ds):
     for tag in ("RescaleSlope", "RescaleIntercept", "WindowCenter", "WindowWidth"):
         if tag in export_ds:
@@ -63,10 +109,46 @@ def _set_uint8_pixel_tags(export_ds, rows, cols, samples=1):
     export_ds.PixelRepresentation = 0
 
 
+def _prepare_uncompressed_export(export_ds):
+    """Ensure exported file uses explicit VR little endian with raw pixel data."""
+    if not hasattr(export_ds, "file_meta") or export_ds.file_meta is None:
+        export_ds.file_meta = pydicom.dataset.Dataset()
+    export_ds.file_meta.TransferSyntaxUID = ExplicitVRLittleEndian
+
+    for tag in (
+        "LossyImageCompression",
+        "LossyImageCompressionRatio",
+        "LossyImageCompressionMethod",
+    ):
+        if tag in export_ds:
+            del export_ds[tag]
+
+
+def can_export_image(ds) -> tuple[bool, str]:
+    sop = str(getattr(ds, "SOPClassUID", ""))
+    if sop == str(EncapsulatedPDFStorage) or getattr(ds, "EncapsulatedDocument", None):
+        return (
+            False,
+            "This DICOM is an encapsulated document (PDF), not an image. "
+            "The Security Demo cannot export image edits for PDF-based DICOM files.",
+        )
+    if not hasattr(ds, "PixelData") or not getattr(ds, "Rows", None):
+        return (
+            False,
+            "This DICOM has no displayable image pixels (e.g. structured report or PDF-only).",
+        )
+    return True, ""
+
+
 def build_export_dataset(ds, image):
     """Copy dataset with current UI pixels (preserve RGB heatmap) and export marker tag."""
+    ok, reason = can_export_image(ds)
+    if not ok:
+        raise ValueError(reason)
+
     export_ds = ds.copy()
-    img = np.asarray(image).astype(np.uint8)
+    img, _ = _extract_2d_image(np.asarray(image), ds)
+    img = img.astype(np.uint8)
 
     if img.size == 0:
         raise ValueError("Cannot export an empty image.")
@@ -74,6 +156,7 @@ def build_export_dataset(ds, image):
     export_ds.ImageComments = EXPORT_COMMENT
     export_ds.SOPInstanceUID = generate_uid()
     _strip_windowing_tags(export_ds)
+    _prepare_uncompressed_export(export_ds)
 
     if hasattr(export_ds, "NumberOfFrames"):
         del export_ds.NumberOfFrames
@@ -82,12 +165,15 @@ def build_export_dataset(ds, image):
         export_ds.PhotometricInterpretation = "RGB"
         export_ds.PlanarConfiguration = 0
         _set_uint8_pixel_tags(export_ds, img.shape[0], img.shape[1], samples=3)
-        export_ds.PixelData = img.tobytes()
+        export_ds.PixelData = img[..., :3].tobytes()
     else:
         if img.ndim == 3:
             import cv2
 
-            img = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+            if img.shape[-1] in (3, 4):
+                img = cv2.cvtColor(img[..., :3], cv2.COLOR_RGB2GRAY)
+            else:
+                img = img[img.shape[0] // 2]
         export_ds.PhotometricInterpretation = "MONOCHROME2"
         _set_uint8_pixel_tags(export_ds, img.shape[0], img.shape[1], samples=1)
         export_ds.PixelData = img.tobytes()
