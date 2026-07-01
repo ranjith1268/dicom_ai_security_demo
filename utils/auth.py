@@ -19,7 +19,7 @@ except ImportError:
     CookieManager = None  # type: ignore[misc, assignment]
     _COOKIES_AVAILABLE = False
 
-from utils.embedded_risk_module import log_breach_event
+from utils.audit_logger import log_breach_event
 
 COOKIE_NAME = "dicom_demo_auth"
 COOKIE_DAYS = 7

@@ -1,6 +1,6 @@
 # DICOM AI Security Demo
 
-Educational **Streamlit** application for demonstrating security risks in medical imaging workflows: PHI metadata tampering, simulated hidden AI processing, audit logging, DICOM export, and **payload embedding/extraction** for security research and training.
+Educational **Streamlit** application for demonstrating security risks in medical imaging workflows: PHI metadata tampering, simulated hidden AI processing, threat embedding, payload extraction, and DICOM safety validation — for security research and red-team training.
 
 > **Disclaimer:** This project is for **education and authorized security testing only**. Do not use it to hide malware in clinical systems or process real patient data without proper authorization.
 
@@ -13,13 +13,11 @@ Educational **Streamlit** application for demonstrating security risks in medica
 - [Installation](#installation)
 - [Running the app](#running-the-app)
 - [Authentication](#authentication)
-- [Application tabs](#application-tabs)
-  - [Security Demo](#1-security-demo)
-  - [Payload Embedder](#2-payload-embedder)
-  - [Payload Extractor](#3-payload-extractor)
-- [Security Breach Logs dashboard](#security-breach-logs-dashboard)
-- [Frequently asked questions](#frequently-asked-questions)
-- [CLI tools](#cli-tools)
+- [Application modules](#application-modules)
+  - [DICOM Threat Embedder](#1-dicom-threat-embedder)
+  - [Payload Extractor](#2-payload-extractor)
+  - [DICOM Safety Validator](#3-dicom-safety-validator)
+- [Security Audit Log](#security-audit-log)
 - [Project structure](#project-structure)
 - [Configuration reference](#configuration-reference)
 - [Known limitations](#known-limitations)
@@ -36,10 +34,11 @@ The app simulates how DICOM medical images can be misused or abused in AI-assist
 | **Metadata tampering** | Patient Name and other tags can be edited with minimal friction |
 | **Image manipulation** | Fake fractures/tumors, crops, heatmaps — changes that could mislead readers |
 | **Hidden AI processing** | Image augmentations trigger a *simulated* background process that logs credential/PHI access |
-| **Steganography** | Scripts and files hidden inside DICOM using private tags or known test patterns |
-| **Audit gaps** | Users see “success” in the UI while CRITICAL events accumulate in logs |
+| **Steganography** | Scripts and files hidden inside DICOM using private tags or known attack patterns |
+| **Auto-run threats** | Launcher scripts appended to DICOMs that execute on double-click via OS file associations |
+| **Audit gaps** | Users see "success" in the UI while CRITICAL events accumulate in logs |
 
-Three main tabs organize the workflow: **Security Demo**, **Payload Embedder**, and **Payload Extractor**.
+Three modules organize the workflow: **DICOM Threat Embedder**, **Payload Extractor**, and **DICOM Safety Validator**.
 
 ---
 
@@ -89,16 +88,8 @@ auth_secret = "random-long-string"
 
 ## Running the app
 
-**Standard:**
-
 ```bash
 streamlit run app.py
-```
-
-**Alternative launcher:**
-
-```bash
-python scripts/run_app.py
 ```
 
 The app opens in your browser (default: `http://localhost:8501`). You must sign in before any feature is available.
@@ -121,174 +112,97 @@ Cookie signing uses `auth_secret` from secrets, or `DEMO_AUTH_SECRET` from the e
 
 ### Logged auth events
 
-Successful login, logout, and failed login attempts are written to `security_breach_logs.csv`.
+Successful login, logout, and failed login attempts are written to the Security Audit Log.
 
 ---
 
-## Application tabs
+## Application modules
 
-### 1. Security Demo
+### 1. DICOM Threat Embedder
 
-Upload a DICOM (`.dcm`), inspect metadata, manipulate the image, and export a modified file.
+7-step wizard to embed known security-research threat patterns into DICOM files.
 
-#### File upload
+#### Embedding patterns
 
-- Supports standard **2D image DICOMs** (CT, MR, DX, etc.)
-- **Multi-frame volumes** (e.g. 200×256×256) display the **middle slice** for editing; export saves that single 2D frame
-- **Encapsulated PDF / document DICOMs** show a clear warning — they have no image pixels for this viewer
-- **Compressed transfer syntax** (JPEG, JPEG 2000, etc.) is decoded for display; export rewrites as uncompressed Explicit VR Little Endian
+| Pattern | What it embeds | Auto-run on double-click |
+|---------|---------------|--------------------------|
+| **Safe embed (private tag)** | Script or file in a private DICOM tag (`DEMO_EMBED`); pixels and standard metadata unchanged | No |
+| **PDF + hidden files** | Encapsulated PDF DICOM with files appended after PDF `%%EOF` | No |
+| **EXE / BAT polyglot preamble** | Batch/DOS stub in the 128-byte preamble + script in pixel tail | Yes (with launcher) |
+| **Pixel-data append** | PowerShell script hidden in PixelData tail (Chrome launcher or Notepad message) | Yes (with launcher) |
 
-#### Modify metadata
+#### Auto-run launcher
 
-- Edit **Patient Name** and click **Apply Changes**
-- Changes are logged as **CRITICAL** in the breach logs
+For **EXE / BAT polyglot** and **Pixel-data append** patterns an auto-run launcher is appended to the file by default. When the `.dcm` is double-clicked on a machine with the `DicomAutoOpen` file association registered, the launcher script extracts and executes the embedded PowerShell payload automatically.
 
-#### Image manipulation
+The wizard generates:
+- A downloadable `.dcm` with the full threat embedded
+- A JSON log recording embed parameters
 
-| Action | Description |
-|--------|-------------|
-| Add Fracture / Add Tumor | Draw simulated findings on the image |
-| Crop / Tilt / Heatmap / Blur / Edge Detection | Augmentations with optional “AI processing” |
+#### Payload types (Pixel-data append)
 
-**Image Augmentation with AI Processing:** Applying crop, tilt, heatmap, blur, or edge detection also runs a **hidden simulated process** that logs system config access, credential theft, PHI access, and data exfiltration — without obvious UI warning. This demonstrates “silent” backend behavior.
-
-#### Export DICOM
-
-- Saves current image + metadata to a new `.dcm`
-- Patient Name in the download reflects metadata **after** Apply Changes
-- RGB heatmaps are preserved on export and re-upload
-- Adds `ImageComments`: `Modified by DICOM AI Security Demo`
-- Export is logged as **CRITICAL**
-
-#### Run Breach Simulation
-
-Standalone **UI-only** demo: five timed messages simulating a vulnerability scan. Does **not** modify DICOM files, access real data, or write to the breach log CSV. Separate from the hidden AI augmentation logs.
+| Payload | Effect when executed |
+|---------|---------------------|
+| **Chrome script** | Opens Chrome via PowerShell |
+| **Notepad script** | Opens Notepad with a custom message |
+| **File payload** | Embeds an arbitrary binary file |
 
 ---
 
-### 2. Payload Embedder
+### 2. Payload Extractor
 
-Build test DICOM files with hidden payloads. The UI follows a **5-step wizard**:
+Upload any `.dcm` and scan for hidden content across all known locations:
 
-1. **Choose embed mode** — Safe embed or Pattern embed  
-2. **Select pattern**  
-3. **Upload files** (contextual per pattern)  
-4. **Options** (launcher, AV test signature, Chrome count when relevant)  
-5. **Review & build** — checklist + **Build DICOM**
-
-Built files and JSON logs are saved under `output/embed/` (gitignored).
-
-#### Safe embed (recommended for viewer compatibility)
-
-Payloads are stored in a **private DICOM tag** (`DEMO_EMBED` creator, group `0x7051`):
-
-- **Pixels and standard metadata are not modified**
-- DICOM viewers that ignore unknown private tags should **open and display normally**
-- Patterns:
-  - Append file (private tag)
-  - Append script (private tag)
-  - Built-in Chrome launcher (PowerShell)
-  - Script + file (both)
-
-**Legacy note:** Older builds appended payload bytes **after end-of-file**, which broke strict viewers. Re-embed with the current safe embed, or extract payloads from legacy files via **Payload Extractor**.
-
-#### Pattern embed
-
-Known security-research file patterns:
-
-| Pattern | Description | Source DICOM required? |
-|---------|-------------|------------------------|
-| **PDF + hidden files** | Encapsulated PDF DICOM; files appended after PDF `%%EOF` (MP3+PDF.dcm style) | No — upload PDF + hidden files; **optional base DICOM** copies patient/study metadata |
-| **EXE polyglot preamble** | MZ DOS stub at byte 0, `DICM` at byte 128 | Yes |
-| **Pixel-data append** | Payload appended to `PixelData` tail | Yes |
-
-#### Embedder options
-
-| Option | Purpose |
-|--------|---------|
-| **Include extraction launcher (scripts)** | Stores a PowerShell helper in the private tag to **manually** find and run embedded scripts. Does **not** auto-execute in DICOM viewers. |
-| **Attach AV test signature (Windows)** | Adds an alternate data stream (ADS) with EICAR test string for manual AV testing |
-| **Chrome open count** | For built-in Chrome launcher patterns |
-
----
-
-### 3. Payload Extractor
-
-Upload any `.dcm` and scan for hidden content:
-
-| Scan location | Used by |
+| Scan location | Detects |
 |---------------|---------|
-| Private tag (`DEMO_EMBED`) | Current safe embed |
-| Pixel data tail | Pixel-data append pattern |
-| End-of-file tail | Legacy safe embed |
+| Private tag (`DEMO_EMBED`) | Safe-embed scripts and files |
+| PixelData tail | Scripts (`<<<DCM_EMBEDDED_SCRIPT>>>`), files (`<<<DCM_EMBEDDED_FILE>>>`) |
+| Encapsulated PDF tail | Files appended after `%%EOF` |
+| Preamble (bytes 0–127) | MZ/DOS stubs, batch script preambles |
+| EOF append | Auto-run launcher (`<<<DCM_FILE_LAUNCHER>>>`), raw binary files |
 
-Download extracted scripts, files, and launcher helpers individually.
+Extracted items are identified by type (EXE, PDF, MP3, ZIP, PS1, BAT, etc.) and offered as individual downloads with correct file extensions.
 
 ---
 
-## Security Breach Logs dashboard
+### 3. DICOM Safety Validator
 
-Full-width section at the bottom of the app (all tabs). Records actions to `security_breach_logs.csv`:
+Defensive companion to the Threat Embedder — scan any `.dcm` and selectively remove identified threats while preserving all legitimate DICOM tags and image data.
+
+#### Detectable threats
+
+| Finding | Severity | Auto-removable |
+|---------|----------|----------------|
+| MZ/DOS executable header in preamble | CRITICAL | Yes |
+| Batch script in preamble (BAT polyglot) | CRITICAL | Yes |
+| Unknown non-zero preamble content | HIGH | Yes |
+| Hidden data after PDF `%%EOF` | HIGH | Yes |
+| Script payload in PixelData tail (uncompressed) | CRITICAL | Yes |
+| Script payload in compressed PixelData | CRITICAL | Yes |
+| Auto-run launcher at EOF | CRITICAL | Yes |
+| Unknown trailing bytes at EOF | HIGH | Yes |
+| Missing required DICOM tags | MEDIUM | No (manual review) |
+
+**Workflow:**
+1. Upload a `.dcm` and click **Scan for Threats**
+2. Review each finding with evidence and location details
+3. Tick **Approve removal** on the threats to fix
+4. Click **Remove Selected Threats** — a cleaned DICOM is generated
+5. Download the remediated file; before/after image preview is shown
+
+---
+
+## Security Audit Log
+
+Full-width section at the bottom of every page. Records all actions:
 
 | Severity | Example actions |
 |----------|-----------------|
-| **CRITICAL** | Metadata edit, DICOM export, payload embed, simulated PHI/credential access |
+| **CRITICAL** | Metadata edit, DICOM export, threat embed, payload scan, file cleaned, simulated PHI/credential access |
 | **HIGH** | Failed login, system config access |
-| **MEDIUM** | Login/logout, image crop/tilt, module init |
+| **MEDIUM** | Login/logout, image augmentation, module init |
 
-**Purpose:** Educational **audit trail** — shows what *would* be logged in a HIPAA-aware environment. CRITICAL warnings on every embed/export are **intentional** for training, not evidence of a real live attack.
-
-Features:
-
-- Refresh / Clear logs
-- Download logs as CSV
-- Severity breakdown and timeline view
-
----
-
-## Frequently asked questions
-
-### What does “Run Breach Simulation” do?
-
-A **cosmetic UI demo only**. It displays five timed messages (vulnerability scan, weak auth, simulated exfiltration, etc.). It does not touch files, networks, or the breach log file.
-
-### Is there a way to extract embedded items from a DICOM?
-
-**Yes** — use the **Payload Extractor** tab. It scans private tags, pixel tails, and legacy EOF payloads and lets you download each item.
-
-### What does “Include extraction launcher (scripts)” do?
-
-It does **not** exploit a DICOM viewer vulnerability. It embeds a **PowerShell script** you must **run yourself** on the file path to locate `<<<DCM_EMBEDDED_SCRIPT>>>` markers and execute the payload. No viewer auto-runs it when opening the image.
-
-### What is the Security Breach Logs dashboard for?
-
-**Teaching and demo tracking** — simulates enterprise security / HIPAA audit logging. It is not a production SIEM or real-time threat detector.
-
----
-
-## CLI tools
-
-### Pattern DICOM builder
-
-```bash
-# Analyze a folder of DICOMs
-python scripts/make_pattern_dicom.py analyze --folder path/to/dicoms
-
-# Encapsulated PDF + hidden files after %%EOF
-python scripts/make_pattern_dicom.py pdf-mp3 --pdf doc.pdf --attach audio.mp3 -o out.dcm
-
-# EXE/DOS polyglot preamble
-python scripts/make_pattern_dicom.py exe-polyglot -i scan.dcm -o polyglot.dcm
-
-# EOF append (legacy pattern — prefer safe private-tag embed in the UI)
-python scripts/make_pattern_dicom.py eof-append -i scan.dcm --attach file.bin -o out.dcm
-```
-
-### Batch metadata edit (local test folder)
-
-```bash
-python scripts/edit_test_dicom_metadata.py
-```
+Features: Refresh, Clear, and Download as CSV.
 
 ---
 
@@ -296,30 +210,29 @@ python scripts/edit_test_dicom_metadata.py
 
 ```
 dicom_ai_security_demo/
-├── app.py                      # Main Streamlit application
+├── app.py                          # Main Streamlit application entry point
 ├── requirements.txt
-├── runtime.txt                 # Python version for Streamlit Cloud
-├── packages.txt                # apt packages for Streamlit Cloud (libgl1)
-├── security_breach_logs.csv    # Generated audit log (runtime)
-├── output/embed/               # Embedded DICOM output (gitignored)
+├── runtime.txt                     # Python version for Streamlit Cloud
+├── packages.txt                    # apt packages for Streamlit Cloud (libgl1)
+├── FUNCTIONALITY.md                # Detailed feature notes
 ├── .streamlit/
 │   ├── config.toml
 │   ├── secrets.toml.example
-│   └── secrets.toml            # Local credentials (gitignored)
-├── scripts/
-│   ├── run_app.py
-│   ├── make_pattern_dicom.py
-│   └── edit_test_dicom_metadata.py
+│   └── secrets.toml                # Local credentials (gitignored)
+├── test_dicom_images/              # Sample clean CT DICOMs for testing
 └── utils/
-    ├── auth.py                 # Login, cookie session
-    ├── breach_simulator.py     # Run Breach Simulation (UI only)
-    ├── dicom_handler.py        # Load, export, metadata, pixel trim
-    ├── embed_engine.py         # Safe embed (private tag)
-    ├── embed_extract.py        # Payload extraction logic
-    ├── embed_ui.py             # Embedder + Extractor UI
-    ├── embedded_risk_module.py # Breach log CSV + hidden AI simulation
-    ├── image_editor.py         # Display, augmentations, 2D slice from volumes
-    └── pattern_dicom_builder.py # PDF polyglot, EXE preamble, pixel append
+    ├── auth.py                     # Login, cookie session management
+    ├── audit_logger.py             # Breach/audit log CSV + hidden AI simulation
+    ├── breach_simulator.py         # Run Breach Simulation (UI-only demo)
+    ├── dicom_handler.py            # Load, export, metadata, pixel utilities
+    ├── dicom_safety.py             # Threat detection + remediation logic
+    ├── embed_engine.py             # Safe embed engine (private DICOM tag)
+    ├── image_editor.py             # Display, augmentations, 2D slice from volumes
+    ├── payload_extractor.py        # Payload extraction logic (all patterns)
+    ├── payload_extractor_ui.py     # Payload Extractor module UI
+    ├── safety_validator_ui.py      # DICOM Safety Validator module UI
+    ├── threat_embedder_ui.py       # DICOM Threat Embedder module UI (7-step wizard)
+    └── threat_pattern_builder.py   # Pattern DICOM builders (PDF, EXE, pixel append)
 ```
 
 ---
@@ -333,19 +246,17 @@ dicom_ai_security_demo/
 | `DEMO_AUTH_SECRET` | HMAC secret for session cookies |
 | `st.secrets["credentials"]` | Username/password in Streamlit Cloud |
 | `st.secrets["auth_secret"]` | Cookie signing secret |
-| `DICOM_REFERENCE_FOLDER` | Default folder for CLI `analyze` |
-| `DICOM_REFERENCE_EXE` | Path to reference file for MZ stub bytes |
 
 ---
 
 ## Known limitations
 
 - **Security Demo** edits **one 2D slice** from multi-frame volumes; full 3D export is not supported.
-- **PDF / encapsulated document DICOMs** cannot be displayed or image-edited in Security Demo.
-- **EXE polyglot** and some pattern embeds may not display in the in-app viewer but are valid for external tools/research.
-- **Payload Extractor** finds payloads using this demo’s formats (`<<<DCM_EMBEDDED_SCRIPT>>>`, `<<<DCM_EMBEDDED_FILE>>>`, private tag `DEMO_EMBED`).
-- **Session cookies** require `extra-streamlit-components`; install with `pip install -r requirements.txt`.
-- **Windows Application Control** policies may block some Python native DLLs (e.g. pandas was removed from the app for this reason).
+- **PDF / encapsulated document DICOMs** cannot be image-edited in Security Demo.
+- **EXE polyglot** and pattern embeds may not display in the in-app viewer but are valid for external tools and research.
+- **Auto-run launcher** requires a `DicomAutoOpen` Windows file association to be registered on the target machine; it does not exploit a DICOM viewer vulnerability.
+- **Payload Extractor** identifies payloads using this demo's magic markers (`<<<DCM_EMBEDDED_SCRIPT>>>`, `<<<DCM_EMBEDDED_FILE>>>`, `<<<DCM_FILE_LAUNCHER>>>`) and standard binary file signatures.
+- **Session cookies** require `extra-streamlit-components`; install via `pip install -r requirements.txt`.
 
 ---
 
@@ -355,10 +266,10 @@ dicom_ai_security_demo/
 |---------|----------|
 | `ModuleNotFoundError: extra_streamlit_components` | `pip install -r requirements.txt` using the **same Python** that runs Streamlit |
 | Logged out on every refresh | Ensure cookies are enabled; redeploy after installing `extra-streamlit-components` |
-| Safe embed breaks old viewers | Re-embed with current version (private tag), not EOF append |
-| Export error on embedded DICOM | Re-upload file; export now forces uncompressed syntax |
-| Shape `(200, 256, 256)` / channel errors | Multi-frame volume — app uses middle slice; re-upload after update |
-| `dcmread: Expected file path... got bytes` | Fixed in embed UI — update to latest `embed_ui.py` |
+| Auto-run not triggering on double-click | Register the `DicomAutoOpen` file association; verify `.dcm` extension is associated |
+| Export error on embedded DICOM | Re-upload the file; export forces uncompressed transfer syntax |
+| Shape `(200, 256, 256)` / channel errors | Multi-frame volume — app uses the middle slice |
+| Cleaner shows 0 threats on a known bad file | File may already be cleaned, or uses a non-standard embedding format |
 | Login fails | Check `.streamlit/secrets.toml` or env vars; default is `admin` / `demo123` |
 
 ---

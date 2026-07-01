@@ -4,11 +4,37 @@ import numpy as np
 import pydicom
 from pydicom.uid import EncapsulatedPDFStorage, ExplicitVRLittleEndian, generate_uid
 
-from utils.embedded_risk_module import log_breach_event
+from utils.audit_logger import log_breach_event
 from utils.image_editor import _extract_2d_image, _is_rgb_image
 
 
 def _expected_pixel_bytes(ds) -> int:
+    """Return expected uncompressed pixel byte count.
+
+    Returns 0 for compressed transfer syntaxes where the PixelData size is
+    variable and the formula rows*cols*bps*spp does not apply.
+    """
+    # Compressed transfer syntaxes — pixel size is unpredictable
+    compressed_syntaxes = {
+        "1.2.840.10008.1.2.4.50",   # JPEG Baseline
+        "1.2.840.10008.1.2.4.51",   # JPEG Extended
+        "1.2.840.10008.1.2.4.57",   # JPEG Lossless
+        "1.2.840.10008.1.2.4.70",   # JPEG Lossless SV1
+        "1.2.840.10008.1.2.4.80",   # JPEG-LS Lossless
+        "1.2.840.10008.1.2.4.81",   # JPEG-LS Near-Lossless
+        "1.2.840.10008.1.2.4.90",   # JPEG 2000 Lossless
+        "1.2.840.10008.1.2.4.91",   # JPEG 2000
+        "1.2.840.10008.1.2.4.92",   # JPEG 2000 Multi-component
+        "1.2.840.10008.1.2.4.93",   # JPEG 2000 Multi-component Lossless
+        "1.2.840.10008.1.2.5",      # RLE Lossless
+    }
+    try:
+        ts = str(ds.file_meta.TransferSyntaxUID) if hasattr(ds, "file_meta") else ""
+        if ts in compressed_syntaxes:
+            return 0
+    except Exception:
+        pass
+
     rows = int(getattr(ds, "Rows", 0) or 0)
     cols = int(getattr(ds, "Columns", 0) or 0)
     if not rows or not cols:

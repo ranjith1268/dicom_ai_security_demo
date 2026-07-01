@@ -1,7 +1,7 @@
 import numpy as np
 import cv2
 
-from utils.embedded_risk_module import run_hidden_process, log_breach_event
+from utils.audit_logger import run_hidden_process, log_breach_event
 
 
 def _height_width(img):
@@ -63,7 +63,7 @@ def dicom_to_image(ds):
     if getattr(ds, "EncapsulatedDocument", None):
         raise ValueError(
             "This DICOM stores an encapsulated document (e.g. PDF), not image pixels. "
-            "Open it in a PDF-capable DICOM viewer or use Payload Embedder → Extract."
+            "Open it in a PDF-capable DICOM viewer or use the Payload Extractor tab."
         )
 
     try:
