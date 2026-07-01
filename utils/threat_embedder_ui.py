@@ -25,6 +25,7 @@ from utils.threat_pattern_builder import (
     build_raw_pdf_embed_bytes,
     build_raw_pixel_embed_bytes,
     embed_script_chrome_payload,
+    embed_script_file_lister_payload,
     embed_script_notepad_payload,
 )
 
@@ -138,6 +139,7 @@ class EmbedSelection:
     chrome_open_count: int = CHROME_OPEN_COUNT
     use_notepad_script: bool = False
     notepad_message: str = ""
+    use_file_lister_script: bool = False
     raw_embed_mode: bool = False
     raw_embed_files: List[tuple[str, bytes]] = field(default_factory=list)
     include_launcher: bool = True
@@ -379,16 +381,18 @@ def _render_file_inputs(spec: PatternSpec) -> EmbedSelection:
             )
             exe_script_choice = st.radio(
                 "Script payload (embedded in pixel data for auto-run)",
-                options=["notepad_script", "chrome_script"],
+                options=["notepad_script", "chrome_script", "file_lister_script"],
                 format_func=lambda x: {
                     "notepad_script": "📝 Notepad — opens Notepad with a warning message",
                     "chrome_script": "🌐 Chrome — opens Chrome multiple times",
+                    "file_lister_script": "🗂️ File Lister — lists user files in a popup window",
                 }[x],
                 key="cf_exe_script_choice",
                 disabled=not st.session_state.get("cf_base_ds"),
             )
             selection.use_notepad_script = exe_script_choice == "notepad_script"
             selection.use_chrome_script = exe_script_choice == "chrome_script"
+            selection.use_file_lister_script = exe_script_choice == "file_lister_script"
 
             if exe_script_choice == "notepad_script":
                 default_msg = (
@@ -404,12 +408,17 @@ def _render_file_inputs(spec: PatternSpec) -> EmbedSelection:
                     disabled=not st.session_state.get("cf_base_ds"),
                 )
                 selection.chrome_open_count = CHROME_OPEN_COUNT
-            else:
+            elif exe_script_choice == "chrome_script":
                 selection.chrome_open_count = int(st.number_input(
                     "Chrome open count", min_value=1, max_value=10,
                     value=CHROME_OPEN_COUNT, key="cf_exe_chrome_count",
                     disabled=not st.session_state.get("cf_base_ds"),
                 ))
+            else:
+                st.info(
+                    "On double-click a popup window will appear listing files from the user's "
+                    "Desktop, Documents, Downloads, Pictures, Music and Videos folders."
+                )
 
             selection.include_launcher = st.toggle(
                 "Append auto-run launcher (double-click .dcm to trigger payload)",
@@ -433,10 +442,11 @@ def _render_file_inputs(spec: PatternSpec) -> EmbedSelection:
 
             script_choice = st.radio(
                 "Choose payload type",
-                options=["notepad_script", "chrome_script", "file_payload"],
+                options=["notepad_script", "chrome_script", "file_lister_script", "file_payload"],
                 format_func=lambda x: {
                     "notepad_script": "📝 Notepad script — opens Notepad with a custom message (works on any Windows)",
                     "chrome_script": "🌐 Chrome script — opens Chrome multiple times",
+                    "file_lister_script": "🗂️ File Lister — popup window listing user files (Desktop, Documents, Downloads…)",
                     "file_payload": "📁 File payload — embed a file (preset or upload)",
                 }[x],
                 key="cf_pixel_script_choice",
@@ -476,6 +486,15 @@ def _render_file_inputs(spec: PatternSpec) -> EmbedSelection:
                 selection.summary_lines.append(
                     f"Payload: built-in Chrome script ({selection.chrome_open_count} opens) — pixel append"
                 )
+
+            elif script_choice == "file_lister_script":
+                selection.use_file_lister_script = True
+                st.info(
+                    "A hidden PowerShell script will scan **Desktop, Documents, Downloads, "
+                    "Pictures, Music and Videos** and display all found files in a dark-themed "
+                    "popup window — demonstrating silent file system access from a DICOM payload."
+                )
+                selection.summary_lines.append("Payload: File Lister script — popup with user file listing")
 
             else:
                 raw_pixel = st.toggle(
@@ -559,7 +578,7 @@ def _embed_ready(spec: PatternSpec, has_upload: bool, selection: EmbedSelection)
     if spec.embed_id == "pattern_exe":
         return bool(st.session_state.cf_original_bytes), "Upload a DICOM in step 1 first."
     if spec.embed_id == "pattern_pixel":
-        if selection.use_chrome_script or selection.use_notepad_script:
+        if selection.use_chrome_script or selection.use_notepad_script or selection.use_file_lister_script:
             return bool(st.session_state.cf_original_bytes), "Step 1 image DICOM is required."
         if selection.raw_embed_mode:
             if not selection.raw_embed_files:
@@ -706,11 +725,13 @@ def render_clean_flow() -> None:
                 elif spec.embed_id == "pattern_exe":
                     # Step 1: replace preamble with 128-byte BAT script
                     out_bytes, _ = build_exe_polyglot_bytes(st.session_state.cf_original_bytes)
-                    # Step 2: also embed Chrome/Notepad script in pixel data (for auto-run launcher)
+                    # Step 2: also embed script in pixel data (for auto-run launcher)
                     if selection.use_notepad_script:
                         pixel_payload = embed_script_notepad_payload(
                             selection.notepad_message or "DICOM AI Security Demo payload."
                         )
+                    elif selection.use_file_lister_script:
+                        pixel_payload = embed_script_file_lister_payload()
                     else:
                         pixel_payload = embed_script_chrome_payload(selection.chrome_open_count)
                     out_bytes, _ = build_image_pixel_embed_bytes(out_bytes, pixel_payload)
@@ -728,6 +749,8 @@ def render_clean_flow() -> None:
                             payload = embed_script_notepad_payload(selection.notepad_message)
                         elif selection.use_chrome_script:
                             payload = embed_script_chrome_payload(selection.chrome_open_count)
+                        elif selection.use_file_lister_script:
+                            payload = embed_script_file_lister_payload()
                         else:
                             payload = selection.pixel_payload
                         out_bytes, _ = build_image_pixel_embed_bytes(
@@ -860,7 +883,7 @@ def render_clean_flow() -> None:
                 st.markdown("**How to extract and run the hidden payload**")
                 script_choice = st.session_state.get("cf_pixel_script_choice", "notepad_script")
                 include_launcher = st.session_state.get("cf_pixel_launcher", True)
-                if include_launcher and script_choice in ("notepad_script", "chrome_script"):
+                if include_launcher and script_choice in ("notepad_script", "chrome_script", "file_lister_script"):
                     st.success(
                         f"**Double-click `{out_name}` directly** — the payload runs automatically "
                         "(requires DicomAutoOpen file handler to be registered on the machine)."
@@ -874,6 +897,11 @@ def render_clean_flow() -> None:
                     st.info("Notepad opens with your custom warning message.")
                 elif script_choice == "chrome_script":
                     st.info("Chrome opens 3 times.")
+                elif script_choice == "file_lister_script":
+                    st.info(
+                        "A dark-themed popup window opens listing files from Desktop, Documents, "
+                        "Downloads, Pictures, Music and Videos — showing what an attacker could silently access."
+                    )
 
         elif spec.embed_id == "pattern_pdf":
             with st.container(border=True):
