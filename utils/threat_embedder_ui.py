@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 import os
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Optional
@@ -13,6 +14,7 @@ import streamlit as st
 
 from utils.defender_scan import scan_with_defender
 from utils.dicom_handler import extract_metadata, load_dicom
+from utils.dicom_handler_register import ensure_dicom_handler_registered
 from utils.embed_engine import (
     EICAR_TEST_STRING,
     build_file_payload,
@@ -297,8 +299,7 @@ def _render_defender_and_stego(out_name: str, emb: bytes) -> None:
     st.divider()
     st.markdown("### Double-click auto-run (Windows)")
     st.caption(
-        "To run the hidden script on double-click, register the handler **once** "
-        "(normal PowerShell, no admin): `scripts\\register_dicom_handler.ps1`. "
+        "Double-click the downloaded `.dcm` to run the hidden script. "
         "PowerShell runs invisibly — only the payload UI (e.g. Notepad) appears."
     )
     st.divider()
@@ -586,10 +587,10 @@ def _render_file_inputs(spec: PatternSpec) -> EmbedSelection:
             st.info(
                 "**BAT/DICOM polyglot** — one `.dcm` file with a hidden 128-byte batch layer inside. "
                 "DICOM viewers read from byte 128 and display the image normally. "
-                "Double-click runs the embedded script when DicomAutoOpen is registered."
+                "Double-click runs the embedded script automatically."
             )
             exe_script_choice = st.radio(
-                "Script payload (embedded in pixel data for auto-run)",
+                "Script payload (stored in private DICOM tag for auto-run)",
                 options=["notepad_script", "chrome_script", "file_lister_script", "custom_script"],
                 format_func=lambda x: {
                     "notepad_script": "📝 Notepad — opens Notepad with a warning message",
@@ -654,8 +655,8 @@ def _render_file_inputs(spec: PatternSpec) -> EmbedSelection:
                 value=True,
                 key="cf_exe_launcher",
                 help=(
-                    "Appends a self-extracting launcher. "
-                    "When DicomAutoOpen is registered, double-clicking the .dcm runs the embedded script automatically."
+                    "Stores a launcher in the private DICOM tag. "
+                    "Double-clicking the .dcm runs the embedded script automatically."
                 ),
                 disabled=not st.session_state.get("cf_base_ds"),
             )
@@ -797,14 +798,13 @@ def _render_file_inputs(spec: PatternSpec) -> EmbedSelection:
                 value=True,
                 key="cf_pixel_launcher",
                 help=(
-                    "Appends a self-extracting launcher to the DICOM. "
-                    "Requires DicomAutoOpen to be registered as the .dcm file handler on the target machine. "
-                    "When registered, double-clicking the .dcm file silently runs the embedded script."
+                    "Stores a launcher in the private DICOM tag. "
+                    "Double-clicking the .dcm silently runs the embedded script."
                 ),
                 disabled=not st.session_state.get("cf_base_ds"),
             )
             if selection.include_launcher:
-                selection.summary_lines.append("Launcher: auto-run on double-click (DicomAutoOpen)")
+                selection.summary_lines.append("Launcher: auto-run on double-click")
 
             if st.session_state.cf_source_name:
                 selection.summary_lines.append(f"Image source: `{st.session_state.cf_source_name}`")
@@ -1117,6 +1117,13 @@ def _render_unified_embed() -> None:
                 st.session_state.cf_embedded_image = _try_load_image(out_bytes) if file_kind == "dicom" else None
                 st.session_state.cf_embed_done = True
 
+                if (
+                    file_kind == "dicom"
+                    and selection.include_launcher
+                    and sys.platform == "win32"
+                ):
+                    ensure_dicom_handler_registered()
+
                 if file_kind == "image":
                     stem = Path(st.session_state.cf_source_name or "image").stem
                     ext = ".png" if st.session_state.cf_is_png else ".jpg"
@@ -1229,8 +1236,8 @@ def _render_unified_embed() -> None:
             include_launcher_exe = st.session_state.get("cf_exe_launcher", True)
             if include_launcher_exe:
                 st.info(
-                    f"Single polyglot `.dcm` file — opens in DICOM viewers **and** runs the "
-                    f"embedded script on double-click when the DicomAutoOpen handler is registered."
+                    "Single polyglot `.dcm` file — double-click to run the embedded script. "
+                    "The DICOM image remains valid for viewers."
                 )
             _render_post_embed_tools(out_name, emb, "application/dicom")
 
@@ -1243,10 +1250,14 @@ def _render_unified_embed() -> None:
                     st.markdown("**How to extract and run the hidden payload**")
                     script_choice = st.session_state.get("cf_pixel_script_choice", "notepad_script")
                     include_launcher = st.session_state.get("cf_pixel_launcher", True)
-                    if include_launcher and script_choice in ("notepad_script", "chrome_script", "file_lister_script"):
+                    if include_launcher and script_choice in (
+                        "notepad_script",
+                        "chrome_script",
+                        "file_lister_script",
+                        "custom_script",
+                    ):
                         st.success(
-                            f"**Double-click `{out_name}` directly** — the payload runs automatically "
-                            "(requires DicomAutoOpen file handler to be registered on the machine)."
+                            f"**Double-click `{out_name}`** — the hidden script runs automatically."
                         )
                     if script_choice == "notepad_script":
                         st.info("Notepad opens with your custom warning message.")

@@ -1,8 +1,5 @@
 #!/usr/bin/env python3
-"""Windows .dcm double-click handler — runs embedded demo payloads.
-
-Register once: scripts\\register_dicom_handler.ps1 (no admin required)
-"""
+"""Windows .dcm double-click handler — runs embedded demo payloads silently."""
 from __future__ import annotations
 
 import io

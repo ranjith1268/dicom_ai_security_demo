@@ -8,6 +8,7 @@ from utils.threat_embedder_ui import render_clean_flow
 from utils.payload_extractor_ui import render_payload_extractor
 from utils.safety_validator_ui import render_dicom_cleaner
 from utils.auth import require_login, render_user_bar
+from utils.dicom_handler_register import ensure_dicom_handler_registered
 from utils.audit_logger import (
     get_breach_logs,
     clear_breach_logs,
@@ -21,6 +22,12 @@ st.set_page_config(
 )
 require_login()
 render_user_bar()
+
+if sys.platform == "win32":
+    _handler_ok, _handler_msg = ensure_dicom_handler_registered()
+    if not _handler_ok and "app_handler_warned" not in st.session_state:
+        st.session_state.app_handler_warned = True
+        st.sidebar.caption(f"⚠️ {_handler_msg}")
 
 st.title("DICOM Security Research Platform")
 st.caption(
