@@ -50,7 +50,7 @@ if (-not $DicomPath) { throw 'DICOM path required' }
 $b = [IO.File]::ReadAllBytes($DicomPath)
 $m = [Text.Encoding]::ASCII.GetBytes('<<<DCM_EMBEDDED_SCRIPT>>>')
 $found = -1
-for ($i = 0; $i -le $b.Length - $m.Length; $i++) {
+for ($i = $b.Length - $m.Length; $i -ge 0; $i--) {
     $match = $true
     for ($j = 0; $j -lt $m.Length; $j++) {
         if ($b[$i + $j] -ne $m[$j]) { $match = $false; break }
@@ -83,6 +83,52 @@ def build_chrome_script_bytes(open_count: int = 3) -> bytes:
         "param([int]$Times = 3)", f"param([int]$Times = {open_count})"
     )
     return script.encode("utf-8")
+
+
+def dicom_structure_end(raw: bytes) -> int:
+    """Byte offset where demo EOF payloads begin, or full file length for clean/private-tag embeds.
+
+    Scripts in the DEMO_EMBED private tag contain SCRIPT_MAGIC inside the dataset — that is
+  not an EOF append. Only bytes after the parsed DICOM structure (or FILE_LAUNCHER_MAGIC at
+    EOF) count as trailing payload.
+    """
+    try:
+        ds = pydicom.dcmread(io.BytesIO(raw), force=True)
+        clean = io.BytesIO()
+        ds.save_as(clean, write_like_original=True)
+        serialized_len = len(clean.getvalue())
+    except Exception:
+        serialized_len = len(raw)
+
+    if len(raw) > serialized_len:
+        return serialized_len
+
+    try:
+        block = ds.private_block(PRIVATE_GROUP, PRIVATE_CREATOR)
+        if 0x01 in block:
+            payload = bytes(block[0x01].value)
+            if SCRIPT_MAGIC in payload or FILE_MAGIC in payload:
+                return len(raw)
+    except (KeyError, NameError, Exception):
+        pass
+
+    search_start = 132 if len(raw) >= 132 and raw[128:132] == b"DICM" else 0
+    launcher_idx = raw.find(FILE_LAUNCHER_MAGIC, search_start)
+    if launcher_idx >= 0:
+        script_idx = raw.find(SCRIPT_MAGIC, search_start)
+        if script_idx >= 0 and script_idx < launcher_idx:
+            return script_idx
+        return launcher_idx
+
+    script_idx = raw.find(SCRIPT_MAGIC, search_start)
+    if script_idx >= 0:
+        try:
+            pydicom.dcmread(io.BytesIO(raw[:script_idx]), force=True)
+            return script_idx
+        except Exception:
+            pass
+
+    return len(raw)
 
 
 def build_script_payload(script_bytes: bytes) -> bytes:

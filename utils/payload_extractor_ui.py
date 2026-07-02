@@ -17,7 +17,8 @@ METHOD_LABELS = {
     "pdf_eof_append":  "PDF %%EOF Append — Hidden after PDF end",
     "pixel_tail":      "Pixel-Data Append — Hidden after image bytes",
     "private_tag":     "Private DICOM Tag",
-    "eof_tail":        "EOF Append (Legacy)",
+    "eof_tail":        "EOF Append — Hidden after DICOM end",
+    "eof_script":      "EOF Script Append — Hidden after DICOM end (viewer-safe)",
     "jpeg_eof_append": "JPEG EOI Append — Hidden after JPEG end marker",
     "png_iend_append": "PNG IEND Append — Hidden after PNG end chunk",
 }
@@ -28,6 +29,23 @@ def render_payload_extractor() -> None:
         st.session_state.extract_items = None
         st.session_state.extract_source = None
 
+    prefill_active = st.session_state.get("extract_prefill_active", False)
+    prefill_bytes = st.session_state.get("extract_prefill_bytes")
+    prefill_name = st.session_state.get("extract_prefill_name", "embedded_file")
+
+    if prefill_active and prefill_bytes:
+        st.success(
+            f"Loaded from Threat Embedder: **`{prefill_name}`** ({len(prefill_bytes):,} bytes). "
+            "Click **Scan for Embedded Payloads** below to analyse."
+        )
+        if st.button("Clear preloaded file", key="extract_clear_prefill"):
+            st.session_state.extract_prefill_active = False
+            st.session_state.extract_prefill_bytes = None
+            st.session_state.extract_prefill_name = None
+            st.session_state.extract_items = None
+            st.session_state.extract_source = None
+            st.rerun()
+
     uploaded = st.file_uploader(
         "Upload file to scan (.dcm, .png, .jpg, .jpeg)",
         type=["dcm", "png", "jpg", "jpeg"],
@@ -35,24 +53,29 @@ def render_payload_extractor() -> None:
         label_visibility="collapsed",
     )
 
-    if uploaded is None:
+    if uploaded is None and not (prefill_active and prefill_bytes):
         st.session_state.extract_items = None
         st.session_state.extract_source = None
         st.info("Upload a `.dcm`, `.png`, or `.jpg` file to scan for embedded payloads.")
         return
 
-    upload_key = f"{uploaded.name}:{uploaded.size}"
-    if st.session_state.get("extract_upload_key") != upload_key:
-        st.session_state.extract_upload_key = upload_key
-        st.session_state.extract_items = None
-        st.session_state.extract_source = None
+    if uploaded is not None:
+        upload_key = f"{uploaded.name}:{uploaded.size}"
+        if st.session_state.get("extract_upload_key") != upload_key:
+            st.session_state.extract_upload_key = upload_key
+            st.session_state.extract_items = None
+            st.session_state.extract_source = None
+            st.session_state.extract_prefill_active = False
+        raw = uploaded.getvalue()
+        fname = uploaded.name
+    else:
+        raw = prefill_bytes
+        fname = prefill_name
 
-    raw = uploaded.getvalue()
-    fname = uploaded.name.lower()
-    is_image_file = fname.endswith((".png", ".jpg", ".jpeg"))
+    is_image_file = fname.lower().endswith((".png", ".jpg", ".jpeg"))
 
     if is_image_file:
-        st.image(raw, caption=f"Uploaded — {uploaded.name}", use_container_width=True)
+        st.image(raw, caption=f"Uploaded — {fname}", use_container_width=True)
     else:
         try:
             ds = load_dicom(io.BytesIO(raw))
@@ -66,7 +89,7 @@ def render_payload_extractor() -> None:
             try:
                 image = dicom_to_image(ds)
                 display, slice_info = _extract_2d_image(image)
-                cap = f"Uploaded DICOM — {uploaded.name}"
+                cap = f"Uploaded DICOM — {fname}"
                 if slice_info.get("is_volume"):
                     cap += f" (slice {slice_info['frame_index'] + 1}/{slice_info['frame_count']})"
                 st.image(display, caption=cap, use_container_width=True)
@@ -82,11 +105,11 @@ def render_payload_extractor() -> None:
         else:
             items = extract_embedded_items(raw)
         st.session_state.extract_items = items
-        st.session_state.extract_source = uploaded.name
+        st.session_state.extract_source = fname
         log_breach_event(
             action="File Scanned",
             data_type="validation",
-            data_accessed=f"payload_extractor scan on {uploaded.name}",
+            data_accessed=f"payload_extractor scan on {fname}",
             severity="INFO",
             endpoint="payload_extractor",
         )
@@ -97,12 +120,12 @@ def render_payload_extractor() -> None:
 
     if not items:
         st.warning(
-            f"No embedded payloads found in `{st.session_state.get('extract_source', uploaded.name)}`. "
+            f"No embedded payloads found in `{st.session_state.get('extract_source', fname)}`. "
             "The file may be clean or use an unknown embedding format."
         )
         return
 
-    st.success(f"Found **{len(items)}** embedded payload item(s) in `{st.session_state.get('extract_source', uploaded.name)}`.")
+    st.success(f"Found **{len(items)}** embedded payload item(s) in `{st.session_state.get('extract_source', fname)}`.")
     for idx, item in enumerate(items):
         name = item.get("name", f"payload_item_{idx + 1}")
         method = item.get("method", "unknown")

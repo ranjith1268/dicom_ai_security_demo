@@ -44,7 +44,7 @@ st.divider()
 
 if mode == "🧬  DICOM Threat Embedder":
     st.header("DICOM Threat Embedder")
-    st.caption("Embed known security-test patterns into DICOM files for red-team and education.")
+    st.caption("Embed threats into DICOM or standard images (PNG/JPG), then scan with Defender and analyse with the Payload Extractor.")
     render_clean_flow()
 
 elif mode == "🔍  Payload Extractor":

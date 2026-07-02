@@ -9,6 +9,7 @@ from typing import List, Optional, Set
 import pydicom
 
 from utils.dicom_handler import _expected_pixel_bytes
+from utils.embed_engine import dicom_structure_end
 
 PDF_EOF_MARKER = b"%%EOF"
 SCRIPT_MAGIC    = b"<<<DCM_EMBEDDED_SCRIPT>>>"
@@ -173,13 +174,47 @@ def analyze_dicom(dicom_bytes: bytes) -> tuple[List[SafetyFinding], Optional[pyd
             )
         )
 
-    dicom_len = len(raw)
     try:
-        clean = io.BytesIO()
-        ds.save_as(clean, write_like_original=True)
-        dicom_len = len(clean.getvalue())
-    except Exception:
+        block = ds.private_block(0x51, "DEMO_EMBED")
+        if 0x01 in block:
+            payload = bytes(block[0x01].value)
+            has_script = SCRIPT_MAGIC in payload
+            has_file = FILE_MAGIC in payload
+            findings.append(SafetyFinding(
+                finding_id="private_001",
+                finding_type="private_tag_script" if has_script else "private_tag_payload",
+                severity="CRITICAL" if has_script else "HIGH",
+                location="Private tag DEMO_EMBED (7051,xx01)",
+                description=(
+                    f"Hidden script in private DICOM tag ({len(payload):,} bytes)"
+                    if has_script else
+                    f"Hidden data in private DICOM tag ({len(payload):,} bytes)"
+                ),
+                evidence=f"DEMO_EMBED block element 0x01 — {len(payload):,} bytes",
+                size_bytes=len(payload),
+                removable=True,
+                recommendation="Remove private-tag payload to restore a clean DICOM",
+            ))
+        if 0x02 in block:
+            launcher = bytes(block[0x02].value)
+            if launcher:
+                findings.append(SafetyFinding(
+                    finding_id="private_launcher_001",
+                    finding_type="private_tag_launcher",
+                    severity="CRITICAL",
+                    location="Private tag DEMO_EMBED (7051,xx02)",
+                    description=(
+                        f"Auto-run launcher in private DICOM tag ({len(launcher):,} bytes)"
+                    ),
+                    evidence=f"DEMO_EMBED block element 0x02 — {len(launcher):,} bytes",
+                    size_bytes=len(launcher),
+                    removable=True,
+                    recommendation="Remove private-tag launcher to prevent auto-execution",
+                ))
+    except KeyError:
         pass
+
+    dicom_len = dicom_structure_end(raw)
     eof_tail = raw[dicom_len:]
     if eof_tail:
         has_launcher = LAUNCHER_MAGIC in eof_tail

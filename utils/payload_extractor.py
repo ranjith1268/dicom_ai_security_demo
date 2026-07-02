@@ -8,7 +8,12 @@ from typing import Any, Dict, List, Optional, Tuple
 import pydicom
 
 from utils.dicom_handler import _expected_pixel_bytes
-from utils.embed_engine import FILE_LAUNCHER_MAGIC, FILE_MAGIC, SCRIPT_MAGIC
+from utils.embed_engine import (
+    FILE_LAUNCHER_MAGIC,
+    FILE_MAGIC,
+    SCRIPT_MAGIC,
+    dicom_structure_end,
+)
 
 PRIVATE_CREATOR = "DEMO_EMBED"
 PRIVATE_GROUP = 0x51
@@ -261,9 +266,7 @@ def extract_embedded_items(dicom_bytes: bytes) -> List[Dict[str, Any]]:
             # Uncompressed image — tail is everything after the expected pixel region
             tail = pixel_bytes[expected:]
         elif not expected:
-            # Compressed image — cannot compute uncompressed size.
-            # Strategy 1: look for demo magic markers using fast rfind
-            found_magic = False
+            # Compressed image — only detect demo magic markers (no binary signature scan).
             for magic in (SCRIPT_MAGIC, FILE_MAGIC):
                 idx = pixel_bytes.rfind(magic)
                 if idx >= 0:
@@ -272,25 +275,7 @@ def extract_embedded_items(dicom_bytes: bytes) -> List[Dict[str, Any]]:
                     for item in parsed:
                         item["method"] = "pixel_tail"
                         results.append(item)
-                    found_magic = True
-            # Strategy 2: scan last 64 KB for known binary file signatures
-            if not found_magic:
-                scan_window = pixel_bytes[-65536:]
-                window_offset = max(0, len(pixel_bytes) - 65536)
-                for sig, ext, label in BINARY_SIGNATURES:
-                    idx = scan_window.find(sig)
-                    if idx >= 0:
-                        abs_idx = window_offset + idx
-                        raw_tail = pixel_bytes[abs_idx:]
-                        for i, seg in enumerate(split_raw_files(raw_tail)):
-                            results.append({
-                                "type": "file",
-                                "name": f"pixel_hidden_{i + 1}{seg['ext']}",
-                                "data": seg["data"],
-                                "method": "pixel_tail",
-                                "description": f"{seg['label']} — {len(seg['data']):,} bytes appended in compressed PixelData",
-                            })
-                        break
+                    break
             tail = b""
         else:
             tail = b""
@@ -301,8 +286,8 @@ def extract_embedded_items(dicom_bytes: bytes) -> List[Dict[str, Any]]:
                 for item in parsed:
                     item["method"] = "pixel_tail"
                     results.append(item)
-            else:
-                # Raw binary — detect and split by file signatures
+            elif SCRIPT_MAGIC not in tail and FILE_MAGIC not in tail:
+                # Only report raw binary tails when no demo markers — avoids noise on padding bytes
                 for i, seg in enumerate(split_raw_files(tail)):
                     ext = seg["ext"]
                     label = seg["label"]
@@ -314,19 +299,15 @@ def extract_embedded_items(dicom_bytes: bytes) -> List[Dict[str, Any]]:
                         "description": f"{label} — {len(seg['data']):,} bytes appended after PixelData",
                     })
 
-    dicom_len = len(dicom_bytes)
-    try:
-        clean = io.BytesIO()
-        ds.save_as(clean, write_like_original=True)
-        dicom_len = len(clean.getvalue())
-    except Exception:
-        pass
-
+    dicom_len = dicom_structure_end(dicom_bytes)
     eof_tail = dicom_bytes[dicom_len:]
     if eof_tail:
-        if FILE_LAUNCHER_MAGIC in eof_tail:
-            idx = eof_tail.find(FILE_LAUNCHER_MAGIC)
-            launcher = eof_tail[idx + len(FILE_LAUNCHER_MAGIC) :]
+        launcher_idx = eof_tail.find(FILE_LAUNCHER_MAGIC)
+        script_region = eof_tail[:launcher_idx] if launcher_idx >= 0 else eof_tail
+        launcher_region = eof_tail[launcher_idx:] if launcher_idx >= 0 else b""
+
+        if launcher_region:
+            launcher = launcher_region[len(FILE_LAUNCHER_MAGIC) :]
             if launcher:
                 results.append({
                     "type": "launcher",
@@ -334,8 +315,8 @@ def extract_embedded_items(dicom_bytes: bytes) -> List[Dict[str, Any]]:
                     "data": launcher,
                     "method": "eof_tail",
                 })
-        for item in _scan_raw_for_payloads(eof_tail):
-            item["method"] = "eof_tail"
+        for item in _scan_raw_for_payloads(script_region):
+            item["method"] = "eof_script" if item.get("type") == "script" else "eof_tail"
             results.append(item)
 
     # De-duplicate by offset+name

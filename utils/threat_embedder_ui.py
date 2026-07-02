@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Optional
@@ -10,6 +11,7 @@ from typing import List, Optional
 import pydicom
 import streamlit as st
 
+from utils.defender_scan import scan_with_defender
 from utils.dicom_handler import extract_metadata, load_dicom
 from utils.embed_engine import (
     EICAR_TEST_STRING,
@@ -18,10 +20,10 @@ from utils.embed_engine import (
 from utils.audit_logger import log_breach_event
 from utils.image_editor import _extract_2d_image, dicom_to_image
 from utils.threat_pattern_builder import (
-    append_autorun_launcher,
     build_encapsulated_pdf_dicom_bytes,
     build_exe_polyglot_bytes,
     build_image_pixel_embed_bytes,
+    build_private_tag_embed_bytes,
     build_jpeg_script_embed,
     build_png_script_embed,
     build_raw_pdf_embed_bytes,
@@ -104,29 +106,32 @@ PATTERN_SPECS: List[PatternSpec] = [
     PatternSpec(
         "pattern_exe",
         "EXE / BAT polyglot preamble",
-        "Batch script preamble (bytes 0-127), DICM at byte 128. "
-        "Rename downloaded .dcm → .bat and double-click to trigger popup.",
+        "128-byte batch preamble + valid DICOM in one file. Always download as `.dcm` — "
+        "the polyglot BAT layer is internal; double-click runs the embedded script via the auto-run handler.",
         True,
         "pattern_exe",
     ),
     PatternSpec(
         "pattern_pixel",
-        "Pixel-data append",
-        "Payload appended to PixelData (DX / US / VL6 style).",
+        "Script / file append (private DICOM tag)",
+        "Payload stored in a private DEMO_EMBED tag — PixelData unchanged and no trailing "
+        "bytes after DICOM EOF, so MicroDicom and RadiAnt open normally. Raw mode uses pixel-tail.",
         True,
         "pattern_pixel",
     ),
 ]
 
 FLOW_STEPS = [
-    "Upload Source DICOM",
-    "Preview Image & Metadata",
-    "Select Embed Pattern",
+    "Upload File (DICOM or Image)",
+    "Preview",
+    "Select Embed Method",
     "Configure Payload",
     "Run Embed",
     "Preview Embedded Result",
-    "Download Embedded DICOM",
+    "Download · Defender Scan · Stego Analysis",
 ]
+
+EMBED_OUTPUT_DIR = Path(__file__).resolve().parents[1] / "output" / "embed" / "latest"
 
 SPEC_BY_ID = {spec.embed_id: spec for spec in PATTERN_SPECS}
 
@@ -143,6 +148,9 @@ class EmbedSelection:
     use_notepad_script: bool = False
     notepad_message: str = ""
     use_file_lister_script: bool = False
+    use_custom_script: bool = False
+    custom_script_bytes: Optional[bytes] = None
+    custom_script_name: str = ""
     raw_embed_mode: bool = False
     raw_embed_files: List[tuple[str, bytes]] = field(default_factory=list)
     include_launcher: bool = True
@@ -158,6 +166,17 @@ def _preset_file_bytes(preset_id: str) -> tuple[str, bytes]:
     raise ValueError(f"Unknown preset: {preset_id}")
 
 
+def _is_script_filename(name: str) -> bool:
+    return name.lower().endswith((".ps1", ".bat", ".cmd"))
+
+
+def _embed_uploaded_payload(name: str, data: bytes) -> bytes:
+    """Wrap upload as SCRIPT_MAGIC (executable) or FILE_MAGIC (attachment)."""
+    if _is_script_filename(name):
+        return build_script_payload(data)
+    return build_file_payload(name, data)
+
+
 def _pixel_file_payload_bytes(preset_id: str, custom_file) -> bytes:
     if preset_id == "demo_text":
         name, data = _preset_file_bytes("demo_text")
@@ -166,7 +185,7 @@ def _pixel_file_payload_bytes(preset_id: str, custom_file) -> bytes:
         name, data = _preset_file_bytes("eicar")
         return build_file_payload(name, data)
     if preset_id == CUSTOM_PAYLOAD_ID and custom_file:
-        return build_file_payload(custom_file.name, custom_file.getvalue())
+        return _embed_uploaded_payload(custom_file.name, custom_file.getvalue())
     raise ValueError("No payload selected.")
 
 
@@ -178,12 +197,19 @@ def _init_state() -> None:
         "cf_metadata": None,
         "cf_original_image": None,
         "cf_base_ds": None,
+        "cf_file_kind": None,
+        "cf_is_png": False,
         "cf_selected_pattern": PATTERN_SPECS[0].embed_id,
         "cf_embedded_bytes": None,
         "cf_embedded_image": None,
+        "cf_embedded_path": None,
+        "cf_embedded_filename": None,
         "cf_embed_done": False,
         "cf_last_embed_pattern": None,
         "cf_pdf_dicom_metadata": None,
+        "cf_defender_result": None,
+        "cf_image_payload_type": "notepad_script",
+        "cf_input_type": "dicom",
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -193,8 +219,188 @@ def _init_state() -> None:
 def _reset_embed_result() -> None:
     st.session_state.cf_embedded_bytes = None
     st.session_state.cf_embedded_image = None
+    st.session_state.cf_embedded_path = None
+    st.session_state.cf_embedded_filename = None
     st.session_state.cf_embed_done = False
     st.session_state.cf_last_embed_pattern = None
+    st.session_state.cf_defender_result = None
+
+
+def _detect_file_kind(name: str, raw: bytes) -> Optional[str]:
+    lower = name.lower()
+    if lower.endswith((".png", ".jpg", ".jpeg")):
+        if raw.startswith(b"\x89PNG\r\n\x1a\n") or raw.startswith(b"\xff\xd8\xff"):
+            return "image"
+        return None
+    try:
+        load_dicom(io.BytesIO(raw))
+        return "dicom"
+    except Exception:
+        return None
+
+
+def _save_embedded_output(data: bytes, filename: str) -> Path:
+    EMBED_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    out_path = EMBED_OUTPUT_DIR / filename
+    out_path.write_bytes(data)
+    st.session_state.cf_embedded_path = str(out_path.resolve())
+    st.session_state.cf_embedded_filename = filename
+    return out_path
+
+
+def _render_defender_and_stego(out_name: str, emb: bytes) -> None:
+    """Windows Defender scan + link to Payload Extractor (no download button)."""
+    saved_path = st.session_state.get("cf_embedded_path")
+    if saved_path:
+        st.caption(f"Server copy (for scanning): `{saved_path}`")
+    st.caption(
+        "Browsers do not share your Downloads folder with this app. "
+        "The server copy has the **same bytes** as your download — use it for Defender scan, "
+        "or paste the path where you saved the file after downloading."
+    )
+
+    default_scan_path = saved_path or ""
+    downloads_guess = os.path.join(os.path.expanduser("~"), "Downloads", out_name)
+    scan_path = st.text_input(
+        "File path to scan with Windows Defender",
+        value=default_scan_path,
+        placeholder=downloads_guess,
+        key=f"cf_defender_scan_path_{out_name}",
+    )
+
+    if st.button("🛡️ Scan with Windows Defender", key=f"cf_defender_scan_btn_{out_name}", width="stretch"):
+        target = Path(scan_path.strip()) if scan_path.strip() else Path(downloads_guess)
+        result = scan_with_defender(target)
+        st.session_state.cf_defender_result = result
+        log_breach_event(
+            action="Windows Defender Scan",
+            data_type="validation",
+            data_accessed=f"{target} | status={result.get('status')}",
+            severity="CRITICAL" if result.get("threats_found") else "INFO",
+            endpoint="threat_embedder",
+        )
+
+    result = st.session_state.get("cf_defender_result")
+    if result:
+        if result.get("status") == "clean":
+            st.success(result.get("message", "Clean"))
+        elif result.get("threats_found"):
+            st.error(result.get("message", "Threat detected"))
+        elif not result.get("available"):
+            st.warning(result.get("message", "Defender unavailable"))
+        else:
+            st.warning(result.get("message", "Scan completed"))
+        if result.get("detail"):
+            with st.expander("Defender scan output"):
+                st.code(result["detail"])
+
+    st.divider()
+    st.markdown("### Double-click auto-run (Windows)")
+    st.caption(
+        "To run the hidden script on double-click, register the handler **once** "
+        "(normal PowerShell, no admin): `scripts\\register_dicom_handler.ps1`. "
+        "PowerShell runs invisibly — only the payload UI (e.g. Notepad) appears."
+    )
+    st.divider()
+    st.markdown("### 🔍 Steganography analysis")
+    st.caption(
+        "Open the **Payload Extractor** to scan this file for hidden scripts, "
+        "launchers, and appended payloads."
+    )
+    if st.button("Open Payload Extractor (Stego App)", key=f"cf_goto_extractor_{out_name}", type="secondary"):
+        st.session_state.extract_prefill_bytes = emb
+        st.session_state.extract_prefill_name = out_name
+        st.session_state.extract_prefill_active = True
+        st.session_state.extract_items = None
+        st.session_state.extract_source = None
+        st.session_state.app_mode = "🔍  Payload Extractor"
+        st.rerun()
+
+
+def _render_post_embed_tools(out_name: str, emb: bytes, mime: str) -> None:
+    """Download, Windows Defender scan, and link to Payload Extractor."""
+    st.download_button(
+        f"⬇️ Download `{out_name}`",
+        emb,
+        out_name,
+        mime,
+        type="primary",
+        key=f"cf_download_main_{out_name}",
+        width="stretch",
+    )
+    st.caption(f"{len(emb):,} bytes")
+    _render_defender_and_stego(out_name, emb)
+
+
+def _render_image_payload_config() -> EmbedSelection:
+    """Payload options for PNG/JPEG stego embed."""
+    selection = EmbedSelection()
+    with st.container(border=True):
+        st.markdown("**Pattern:** Image stego — PNG/JPEG EOF append")
+        st.caption(
+            "Script is hidden after the image end marker. The picture looks identical "
+            "in any viewer until analysed."
+        )
+        payload_type = st.radio(
+            "Choose payload",
+            ["notepad_script", "chrome_script", "file_lister_script", "custom_script"],
+            format_func=lambda x: {
+                "notepad_script": "📝 Notepad — opens Notepad with a warning message",
+                "chrome_script": "🌐 Chrome — opens Chrome multiple times",
+                "file_lister_script": "🗂️ File Lister — popup listing user files",
+                "custom_script": "📜 Custom script — upload your own .ps1 / .bat file",
+            }[x],
+            key="cf_image_payload_type",
+        )
+
+        if payload_type == "notepad_script":
+            selection.use_notepad_script = True
+            selection.notepad_message = st.text_area(
+                "Message to display in Notepad",
+                value=(
+                    "WARNING: This image file contained a hidden malicious script.\r\n\r\n"
+                    "The payload was appended after the image data — the picture looked "
+                    "completely normal in any viewer.\r\n\r\n"
+                    "--- DICOM AI Security Demo ---"
+                ),
+                height=120,
+                key="cf_image_notepad_msg",
+            )
+        elif payload_type == "chrome_script":
+            selection.use_chrome_script = True
+            selection.chrome_open_count = int(st.number_input(
+                "Chrome open count", min_value=1, max_value=10,
+                value=CHROME_OPEN_COUNT, key="cf_image_chrome_count",
+            ))
+        elif payload_type == "file_lister_script":
+            selection.use_file_lister_script = True
+            st.info(
+                "A popup window will list files from Desktop, Documents, Downloads, "
+                "Pictures, Music and Videos when the script runs."
+            )
+        else:
+            selection.use_custom_script = True
+            script_file = st.file_uploader(
+                "Upload PowerShell or batch script (.ps1, .bat, .cmd)",
+                type=["ps1", "bat", "cmd"],
+                key="cf_image_custom_script",
+            )
+            if script_file:
+                selection.custom_script_name = script_file.name
+                selection.custom_script_bytes = script_file.getvalue()
+                selection.pixel_payload = build_script_payload(selection.custom_script_bytes)
+                selection.summary_lines.append(
+                    f"Payload: `{script_file.name}` ({script_file.size:,} bytes) — custom script"
+                )
+                st.caption(
+                    "Embedded with SCRIPT_MAGIC so Payload Extractor and manual "
+                    "`powershell -File` execution work correctly."
+                )
+            else:
+                st.warning("Upload a script file to continue.")
+        if not selection.use_custom_script:
+            selection.summary_lines.append(f"Payload: {payload_type} — image EOF append")
+    return selection
 
 
 def _try_load_image(dicom_bytes: bytes):
@@ -378,17 +584,18 @@ def _render_file_inputs(spec: PatternSpec) -> EmbedSelection:
 
         elif spec.embed_id == "pattern_exe":
             st.info(
-                "**BAT/DICOM polyglot** — preamble is a 128-byte batch script. "
-                "As `.bat` it executes; as `.dcm` it opens as a medical image. "
-                "The auto-run launcher (below) also lets double-clicking the `.dcm` trigger the payload directly."
+                "**BAT/DICOM polyglot** — one `.dcm` file with a hidden 128-byte batch layer inside. "
+                "DICOM viewers read from byte 128 and display the image normally. "
+                "Double-click runs the embedded script when DicomAutoOpen is registered."
             )
             exe_script_choice = st.radio(
                 "Script payload (embedded in pixel data for auto-run)",
-                options=["notepad_script", "chrome_script", "file_lister_script"],
+                options=["notepad_script", "chrome_script", "file_lister_script", "custom_script"],
                 format_func=lambda x: {
                     "notepad_script": "📝 Notepad — opens Notepad with a warning message",
                     "chrome_script": "🌐 Chrome — opens Chrome multiple times",
                     "file_lister_script": "🗂️ File Lister — lists user files in a popup window",
+                    "custom_script": "📜 Custom script — upload your own .ps1 / .bat file",
                 }[x],
                 key="cf_exe_script_choice",
                 disabled=not st.session_state.get("cf_base_ds"),
@@ -396,6 +603,7 @@ def _render_file_inputs(spec: PatternSpec) -> EmbedSelection:
             selection.use_notepad_script = exe_script_choice == "notepad_script"
             selection.use_chrome_script = exe_script_choice == "chrome_script"
             selection.use_file_lister_script = exe_script_choice == "file_lister_script"
+            selection.use_custom_script = exe_script_choice == "custom_script"
 
             if exe_script_choice == "notepad_script":
                 default_msg = (
@@ -417,6 +625,24 @@ def _render_file_inputs(spec: PatternSpec) -> EmbedSelection:
                     value=CHROME_OPEN_COUNT, key="cf_exe_chrome_count",
                     disabled=not st.session_state.get("cf_base_ds"),
                 ))
+            elif exe_script_choice == "custom_script":
+                script_file = st.file_uploader(
+                    "Upload PowerShell or batch script (.ps1, .bat, .cmd)",
+                    type=["ps1", "bat", "cmd"],
+                    key="cf_exe_custom_script",
+                    disabled=not st.session_state.get("cf_base_ds"),
+                )
+                if script_file:
+                    selection.custom_script_name = script_file.name
+                    selection.custom_script_bytes = script_file.getvalue()
+                    selection.pixel_payload = build_script_payload(selection.custom_script_bytes)
+                    selection.summary_lines.append(
+                        f"Pixel script: `{script_file.name}` — custom upload (auto-run compatible)"
+                    )
+                st.caption(
+                    "Custom scripts are embedded with SCRIPT_MAGIC so the auto-run launcher "
+                    "can find and execute them on double-click."
+                )
             else:
                 st.info(
                     "On double-click a popup window will appear listing files from the user's "
@@ -441,16 +667,17 @@ def _render_file_inputs(spec: PatternSpec) -> EmbedSelection:
                     selection.summary_lines.append("Launcher: auto-run on double-click")
 
         elif spec.embed_id == "pattern_pixel":
-            st.markdown("**Payload** — appended after PixelData")
+            st.markdown("**Payload** — stored in private DICOM tag (PixelData unchanged)")
 
             script_choice = st.radio(
                 "Choose payload type",
-                options=["notepad_script", "chrome_script", "file_lister_script", "file_payload"],
+                options=["notepad_script", "chrome_script", "file_lister_script", "custom_script", "file_payload"],
                 format_func=lambda x: {
                     "notepad_script": "📝 Notepad script — opens Notepad with a custom message (works on any Windows)",
                     "chrome_script": "🌐 Chrome script — opens Chrome multiple times",
                     "file_lister_script": "🗂️ File Lister — popup window listing user files (Desktop, Documents, Downloads…)",
-                    "file_payload": "📁 File payload — embed a file (preset or upload)",
+                    "custom_script": "📜 Custom script — upload your own .ps1 / .bat (auto-run compatible)",
+                    "file_payload": "📁 File payload — embed a non-script file (mp3, pdf, exe, txt, …)",
                 }[x],
                 key="cf_pixel_script_choice",
                 disabled=not st.session_state.get("cf_base_ds"),
@@ -499,6 +726,26 @@ def _render_file_inputs(spec: PatternSpec) -> EmbedSelection:
                 )
                 selection.summary_lines.append("Payload: File Lister script — popup with user file listing")
 
+            elif script_choice == "custom_script":
+                selection.use_custom_script = True
+                script_file = st.file_uploader(
+                    "Upload PowerShell or batch script (.ps1, .bat, .cmd)",
+                    type=["ps1", "bat", "cmd"],
+                    key="cf_pixel_custom_script",
+                    disabled=not st.session_state.get("cf_base_ds"),
+                )
+                if script_file:
+                    selection.custom_script_name = script_file.name
+                    selection.custom_script_bytes = script_file.getvalue()
+                    selection.pixel_payload = build_script_payload(selection.custom_script_bytes)
+                    selection.summary_lines.append(
+                        f"Payload: `{script_file.name}` ({script_file.size:,} bytes) — custom script"
+                    )
+                st.caption(
+                    "Uses SCRIPT_MAGIC (not FILE_MAGIC) so double-click auto-run and "
+                    "Payload Extractor both recognise it as an executable script."
+                )
+
             else:
                 raw_pixel = st.toggle(
                     "Raw embed mode (no magic markers — like exe_embedded_dicom-1.dcm sample file)",
@@ -527,14 +774,16 @@ def _render_file_inputs(spec: PatternSpec) -> EmbedSelection:
                     preset_id = _render_preset_radio("cf_pixel_preset")
                     if preset_id == CUSTOM_PAYLOAD_ID:
                         custom_file = st.file_uploader(
-                            "Payload file (mp3, pdf, exe, txt, …)",
+                            "Payload file (mp3, pdf, exe, txt, … — not .ps1; use Custom script above)",
+                            type=["mp3", "pdf", "exe", "txt", "zip", "bin"],
                             key="cf_pixel_custom",
                             disabled=not st.session_state.get("cf_base_ds"),
                         )
                         if custom_file:
                             selection.pixel_payload = _pixel_file_payload_bytes(preset_id, custom_file)
+                            wrap = "script" if _is_script_filename(custom_file.name) else "file"
                             selection.summary_lines.append(
-                                f"Payload: `{custom_file.name}` ({custom_file.size:,} bytes) — upload"
+                                f"Payload: `{custom_file.name}` ({custom_file.size:,} bytes) — {wrap} upload"
                             )
                     else:
                         selection.pixel_payload = _pixel_file_payload_bytes(preset_id, None)
@@ -569,8 +818,15 @@ def _render_file_inputs(spec: PatternSpec) -> EmbedSelection:
 
 
 def _embed_ready(spec: PatternSpec, has_upload: bool, selection: EmbedSelection) -> tuple[bool, str]:
+    file_kind = st.session_state.get("cf_file_kind")
     if not has_upload:
-        return False, "Upload a DICOM file in step 1 first."
+        return False, "Upload a DICOM or image file in step 1 first."
+
+    if file_kind == "image":
+        if selection.use_custom_script and not selection.pixel_payload:
+            return False, "Upload a custom .ps1 / .bat script in step 4."
+        return True, ""
+
     if spec.embed_id == "pattern_pdf":
         if not selection.pdf_bytes:
             return False, "Choose a PDF (upload or demo) in step 4."
@@ -579,10 +835,16 @@ def _embed_ready(spec: PatternSpec, has_upload: bool, selection: EmbedSelection)
             return False, "Upload at least one file to hide after %%EOF."
         return True, ""
     if spec.embed_id == "pattern_exe":
+        if selection.use_custom_script and not selection.pixel_payload:
+            return False, "Upload a custom .ps1 / .bat script in step 4."
         return bool(st.session_state.cf_original_bytes), "Upload a DICOM in step 1 first."
     if spec.embed_id == "pattern_pixel":
         if selection.use_chrome_script or selection.use_notepad_script or selection.use_file_lister_script:
             return bool(st.session_state.cf_original_bytes), "Step 1 image DICOM is required."
+        if selection.use_custom_script:
+            if not selection.pixel_payload:
+                return False, "Upload a custom .ps1 / .bat script in step 4."
+            return bool(st.session_state.cf_original_bytes), "Step 1 DICOM is required."
         if selection.raw_embed_mode:
             if not selection.raw_embed_files:
                 return False, "Upload at least one file to embed in raw mode."
@@ -593,152 +855,52 @@ def _embed_ready(spec: PatternSpec, has_upload: bool, selection: EmbedSelection)
     return False, "Unknown pattern."
 
 
-def _render_image_file_embed() -> None:
-    """Standalone mini-wizard: embed a script payload into a PNG or JPEG file."""
-    st.markdown(
-        "Append a hidden script payload after the image's end marker. "
-        "The image opens and displays normally in any viewer — the payload is invisible "
-        "until scanned by the Payload Extractor."
-    )
-
-    tab_key = "img_embed"
-
-    uploaded_img = st.file_uploader(
-        "Upload a PNG or JPEG image",
-        type=["png", "jpg", "jpeg"],
-        key=f"{tab_key}_uploader",
-        label_visibility="collapsed",
-    )
-
-    if uploaded_img is None:
-        st.info("Upload a PNG or JPEG to continue.")
-        return
-
-    raw_img = uploaded_img.getvalue()
-    fname = uploaded_img.name
-    is_png = fname.lower().endswith(".png")
-    fmt_label = "PNG" if is_png else "JPEG"
-
-    col_prev, col_info = st.columns([1, 1])
-    with col_prev:
-        st.image(raw_img, caption=f"Source — {fname}", use_container_width=True)
-    with col_info:
-        st.metric("Original size", f"{len(raw_img):,} bytes")
-        st.caption(f"Format: {fmt_label}")
-
-    st.divider()
-    st.markdown("**Select payload to embed**")
-
-    payload_type = st.radio(
-        "Payload",
-        ["notepad_script", "chrome_script", "file_lister_script"],
-        format_func=lambda x: {
-            "notepad_script":     "📝 Notepad — opens Notepad with a warning message",
-            "chrome_script":      "🌐 Chrome — opens Chrome multiple times",
-            "file_lister_script": "🗂️ File Lister — popup listing user files",
-        }[x],
-        key=f"{tab_key}_payload_type",
-    )
-
-    notepad_msg = ""
-    chrome_count = CHROME_OPEN_COUNT
-
-    if payload_type == "notepad_script":
-        notepad_msg = st.text_area(
-            "Message to display in Notepad",
-            value=(
-                "WARNING: This image file contained a hidden malicious script.\r\n\r\n"
-                "The payload was appended after the image data — the picture looked "
-                "completely normal in any viewer.\r\n\r\n"
-                "--- DICOM AI Security Demo ---"
-            ),
-            height=120,
-            key=f"{tab_key}_notepad_msg",
-        )
-    elif payload_type == "chrome_script":
-        chrome_count = int(st.number_input(
-            "Chrome open count", min_value=1, max_value=10,
-            value=CHROME_OPEN_COUNT, key=f"{tab_key}_chrome_count",
-        ))
-    else:
-        st.info(
-            "A dark-themed popup window will list files from Desktop, Documents, "
-            "Downloads, Pictures, Music and Videos when the script runs."
-        )
-
-    if st.button("▶ Embed Payload", type="primary", key=f"{tab_key}_embed_btn", width="stretch"):
-        if payload_type == "notepad_script":
-            payload_bytes = embed_script_notepad_payload(notepad_msg)
-        elif payload_type == "chrome_script":
-            payload_bytes = embed_script_chrome_payload(chrome_count)
-        else:
-            payload_bytes = embed_script_file_lister_payload()
-
-        try:
-            if is_png:
-                result_bytes, log = build_png_script_embed(raw_img, payload_bytes)
-            else:
-                result_bytes, log = build_jpeg_script_embed(raw_img, payload_bytes)
-
-            st.session_state[f"{tab_key}_result"] = result_bytes
-            st.session_state[f"{tab_key}_result_name"] = fname
-            st.session_state[f"{tab_key}_log"] = log
-
-            log_breach_event(
-                action="Image File Embed",
-                data_type="threat_embed",
-                data_accessed=f"{fmt_label} file embed: {fname} | payload={payload_type}",
-                severity="CRITICAL",
-                endpoint="threat_embedder",
-            )
-        except Exception as err:
-            st.error(f"Embed failed: {err}")
-
-    result = st.session_state.get(f"{tab_key}_result")
-    result_name = st.session_state.get(f"{tab_key}_result_name", fname)
-    if result:
-        added = len(result) - len(raw_img)
-        st.success(f"Payload embedded — {len(raw_img):,} → {len(result):,} bytes (+{added:,} bytes hidden)")
-
-        col_before, col_after = st.columns(2)
-        with col_before:
-            st.image(raw_img, caption="Original image", use_container_width=True)
-        with col_after:
-            st.image(result, caption="Embedded image (looks identical)", use_container_width=True)
-
-        stem = Path(result_name).stem
-        ext = Path(result_name).suffix
-        out_name = f"{stem}_embedded{ext}"
-        st.download_button(
-            f"⬇️ Download Embedded {fmt_label}",
-            result,
-            out_name,
-            "image/png" if is_png else "image/jpeg",
-            type="primary",
-            key=f"{tab_key}_dl",
-            width="stretch",
-        )
-        with st.expander("Build log"):
-            st.json(st.session_state.get(f"{tab_key}_log", {}))
-
-        st.info(
-            f"To extract the payload: go to **Payload Extractor** → upload `{out_name}` → Scan. "
-            "The embedded script will appear as a downloadable `.ps1` item."
-        )
-
-
-def _render_dicom_embed() -> None:
-    """Full 7-step DICOM threat embed wizard."""
-    st.subheader("7-Step Threat Embed Workflow")
+def _render_unified_embed() -> None:
+    """Unified wizard: DICOM or PNG/JPEG upload → embed → download → Defender → stego link."""
+    st.subheader("Threat Embed Workflow")
     st.markdown(
         " | ".join(f"**{i}.** {title}" for i, title in enumerate(FLOW_STEPS, start=1))
     )
 
-    _step_header(1, FLOW_STEPS[0], st.session_state.cf_base_ds is not None)
+    _step_header(1, FLOW_STEPS[0], st.session_state.cf_file_kind is not None)
+
+    prev_input_type = st.session_state.get("_cf_input_type_prev", st.session_state.get("cf_input_type", "dicom"))
+    input_type = st.radio(
+        "File type",
+        options=["dicom", "image"],
+        format_func=lambda x: {
+            "dicom": "DICOM — medical imaging file (.dcm)",
+            "image": "Non-DICOM — standard image (.png, .jpg, .jpeg)",
+        }[x],
+        horizontal=True,
+        key="cf_input_type",
+    )
+
+    if input_type != prev_input_type:
+        st.session_state._cf_input_type_prev = input_type
+        st.session_state.cf_upload_key = None
+        st.session_state.cf_original_bytes = None
+        st.session_state.cf_original_image = None
+        st.session_state.cf_metadata = None
+        st.session_state.cf_base_ds = None
+        st.session_state.cf_file_kind = None
+        _reset_embed_result()
+    elif "_cf_input_type_prev" not in st.session_state:
+        st.session_state._cf_input_type_prev = input_type
+
+    if input_type == "dicom":
+        upload_types = ["dcm"]
+        upload_label = "Upload DICOM file (.dcm)"
+        st.caption("Only `.dcm` files are accepted for this selection.")
+    else:
+        upload_types = ["png", "jpg", "jpeg"]
+        upload_label = "Upload image file (.png, .jpg, .jpeg)"
+        st.caption("Only PNG or JPEG images are accepted for this selection.")
+
     uploaded = st.file_uploader(
-        "Choose a `.dcm` file",
-        type=["dcm"],
-        key="cf_file_uploader",
+        upload_label,
+        type=upload_types,
+        key=f"cf_file_uploader_{input_type}",
         label_visibility="collapsed",
     )
 
@@ -748,41 +910,69 @@ def _render_dicom_embed() -> None:
         st.session_state.cf_original_image = None
         st.session_state.cf_metadata = None
         st.session_state.cf_base_ds = None
+        st.session_state.cf_file_kind = None
         _reset_embed_result()
     else:
         upload_key = f"{uploaded.name}:{uploaded.size}"
         if st.session_state.cf_upload_key != upload_key:
-            try:
-                raw = uploaded.getvalue()
-                ds = load_dicom(io.BytesIO(raw))
-                image = dicom_to_image(ds)
+            raw = uploaded.getvalue()
+            kind = _detect_file_kind(uploaded.name, raw)
+            expected_kind = "dicom" if input_type == "dicom" else "image"
+            if kind != expected_kind:
+                st.error(
+                    f"This file is not a valid {expected_kind.upper()} for the selected type. "
+                    f"Switch the radio above or upload a different file."
+                )
+                st.session_state.cf_file_kind = None
+            elif kind is None:
+                st.error("Could not read this file. Upload a valid DICOM or PNG/JPEG image.")
+                st.session_state.cf_file_kind = None
+            else:
                 st.session_state.cf_upload_key = upload_key
                 st.session_state.cf_source_name = uploaded.name
                 st.session_state.cf_original_bytes = raw
-                st.session_state.cf_base_ds = ds
-                st.session_state.cf_original_image = image
-                st.session_state.cf_metadata = extract_metadata(ds)
-                _reset_embed_result()
-            except ValueError as error:
-                st.warning(str(error))
-                raw = uploaded.getvalue()
-                ds = load_dicom(io.BytesIO(raw))
-                st.session_state.cf_upload_key = upload_key
-                st.session_state.cf_source_name = uploaded.name
-                st.session_state.cf_original_bytes = raw
-                st.session_state.cf_base_ds = ds
-                st.session_state.cf_original_image = None
-                st.session_state.cf_metadata = extract_metadata(ds)
-                _reset_embed_result()
-            except Exception as error:
-                st.error(f"Could not load DICOM: {error}")
+                st.session_state.cf_file_kind = kind
+                st.session_state.cf_is_png = uploaded.name.lower().endswith(".png")
+
+                if kind == "image":
+                    st.session_state.cf_base_ds = None
+                    st.session_state.cf_original_image = None
+                    st.session_state.cf_metadata = {
+                        "File Type": "PNG" if st.session_state.cf_is_png else "JPEG",
+                        "Size (bytes)": len(raw),
+                        "Filename": uploaded.name,
+                    }
+                else:
+                    try:
+                        ds = load_dicom(io.BytesIO(raw))
+                        image = dicom_to_image(ds)
+                        st.session_state.cf_base_ds = ds
+                        st.session_state.cf_original_image = image
+                        st.session_state.cf_metadata = extract_metadata(ds)
+                    except ValueError as error:
+                        st.warning(str(error))
+                        ds = load_dicom(io.BytesIO(raw))
+                        st.session_state.cf_base_ds = ds
+                        st.session_state.cf_original_image = None
+                        st.session_state.cf_metadata = extract_metadata(ds)
+                    except Exception as error:
+                        st.error(f"Could not load DICOM: {error}")
+                        st.session_state.cf_file_kind = None
+                        st.session_state.cf_base_ds = None
                 _reset_embed_result()
 
-    has_upload = st.session_state.cf_base_ds is not None
-    has_image = st.session_state.cf_original_image is not None
+    has_upload = st.session_state.cf_file_kind is not None
+    file_kind = st.session_state.get("cf_file_kind")
+    has_image_preview = file_kind == "image" or st.session_state.cf_original_image is not None
 
     _step_header(2, FLOW_STEPS[1], has_upload)
-    if has_image:
+    if file_kind == "image" and st.session_state.cf_original_bytes:
+        st.image(
+            st.session_state.cf_original_bytes,
+            caption=f"Original — {st.session_state.cf_source_name}",
+            use_container_width=True,
+        )
+    elif has_image_preview:
         display_img, slice_info = _extract_2d_image(st.session_state.cf_original_image)
         caption = "Original image"
         if slice_info.get("is_volume"):
@@ -791,34 +981,43 @@ def _render_dicom_embed() -> None:
     elif has_upload:
         st.info("No image preview. Metadata from step 1 is still used for PDF pattern.")
     else:
-        st.info("Upload a DICOM file to continue.")
+        st.info("Upload a DICOM or image file to continue.")
 
     if has_upload and st.session_state.cf_metadata:
-        with st.expander("Metadata"):
+        with st.expander("File details"):
             st.json(st.session_state.cf_metadata)
 
     _step_header(3, FLOW_STEPS[2], has_upload)
-    labels = [spec.label for spec in PATTERN_SPECS]
-    ids = [spec.embed_id for spec in PATTERN_SPECS]
-    current_idx = ids.index(st.session_state.cf_selected_pattern) if st.session_state.cf_selected_pattern in ids else 0
-    selected_label = st.radio(
-        "Pattern embed method",
-        labels,
-        index=current_idx,
-        key="cf_pattern_radio",
-        disabled=not has_upload,
-        label_visibility="collapsed",
-    )
-    new_id = ids[labels.index(selected_label)]
-    if new_id != st.session_state.cf_selected_pattern:
-        st.session_state.cf_selected_pattern = new_id
-        _reset_embed_result()
-
-    spec = _get_spec()
-    st.caption(spec.description)
+    if file_kind == "image":
+        st.info(
+            "**Embed method:** Image stego — payload appended after PNG IEND / JPEG EOI. "
+            "The image displays normally in any viewer."
+        )
+        spec = PatternSpec("pattern_image", "Image stego", "", False, "embedded")
+    else:
+        labels = [s.label for s in PATTERN_SPECS]
+        ids = [s.embed_id for s in PATTERN_SPECS]
+        current_idx = ids.index(st.session_state.cf_selected_pattern) if st.session_state.cf_selected_pattern in ids else 0
+        selected_label = st.radio(
+            "Pattern embed method",
+            labels,
+            index=current_idx,
+            key="cf_pattern_radio",
+            disabled=not has_upload,
+            label_visibility="collapsed",
+        )
+        new_id = ids[labels.index(selected_label)]
+        if new_id != st.session_state.cf_selected_pattern:
+            st.session_state.cf_selected_pattern = new_id
+            _reset_embed_result()
+        spec = _get_spec()
+        st.caption(spec.description)
 
     _step_header(4, FLOW_STEPS[3], has_upload)
-    selection = _render_file_inputs(spec)
+    if file_kind == "image":
+        selection = _render_image_payload_config()
+    else:
+        selection = _render_file_inputs(spec)
 
     ready, block_reason = _embed_ready(spec, has_upload, selection)
     _step_header(5, FLOW_STEPS[4], st.session_state.cf_embed_done)
@@ -831,8 +1030,24 @@ def _render_dicom_embed() -> None:
         width="stretch",
     ):
         try:
-            with st.spinner(f"Building {spec.label}…"):
-                if spec.embed_id == "pattern_pdf":
+            with st.spinner("Building embedded file…"):
+                if file_kind == "image":
+                    raw_img = st.session_state.cf_original_bytes
+                    if selection.use_notepad_script:
+                        payload = embed_script_notepad_payload(selection.notepad_message)
+                    elif selection.use_chrome_script:
+                        payload = embed_script_chrome_payload(selection.chrome_open_count)
+                    elif selection.use_custom_script:
+                        payload = selection.pixel_payload
+                    else:
+                        payload = embed_script_file_lister_payload()
+                    if st.session_state.cf_is_png:
+                        out_bytes, _ = build_png_script_embed(raw_img, payload)
+                    else:
+                        out_bytes, _ = build_jpeg_script_embed(raw_img, payload)
+                    st.session_state.cf_last_embed_pattern = "pattern_image"
+                    st.session_state.cf_embedded_image = None
+                elif spec.embed_id == "pattern_pdf":
                     if selection.raw_embed_mode and selection.raw_embed_files:
                         # Build a PDF DICOM first, then append raw files after %%EOF
                         pdf_only_bytes = _build_pdf(
@@ -859,21 +1074,22 @@ def _render_dicom_embed() -> None:
                             selection.pdf_metadata,
                         )
                 elif spec.embed_id == "pattern_exe":
-                    # Step 1: replace preamble with 128-byte BAT script
                     out_bytes, _ = build_exe_polyglot_bytes(st.session_state.cf_original_bytes)
-                    # Step 2: also embed script in pixel data (for auto-run launcher)
                     if selection.use_notepad_script:
-                        pixel_payload = embed_script_notepad_payload(
+                        script_payload = embed_script_notepad_payload(
                             selection.notepad_message or "DICOM AI Security Demo payload."
                         )
                     elif selection.use_file_lister_script:
-                        pixel_payload = embed_script_file_lister_payload()
+                        script_payload = embed_script_file_lister_payload()
+                    elif selection.use_custom_script:
+                        script_payload = selection.pixel_payload
                     else:
-                        pixel_payload = embed_script_chrome_payload(selection.chrome_open_count)
-                    out_bytes, _ = build_image_pixel_embed_bytes(out_bytes, pixel_payload)
-                    # Step 3: append auto-run launcher
-                    if selection.include_launcher:
-                        out_bytes = append_autorun_launcher(out_bytes)
+                        script_payload = embed_script_chrome_payload(selection.chrome_open_count)
+                    out_bytes, _ = build_private_tag_embed_bytes(
+                        out_bytes,
+                        script_payload,
+                        include_launcher=selection.include_launcher,
+                    )
                 else:
                     if selection.raw_embed_mode and selection.raw_embed_files:
                         out_bytes, _ = build_raw_pixel_embed_bytes(
@@ -887,29 +1103,47 @@ def _render_dicom_embed() -> None:
                             payload = embed_script_chrome_payload(selection.chrome_open_count)
                         elif selection.use_file_lister_script:
                             payload = embed_script_file_lister_payload()
+                        elif selection.use_custom_script:
+                            payload = selection.pixel_payload
                         else:
                             payload = selection.pixel_payload
-                        out_bytes, _ = build_image_pixel_embed_bytes(
+                        out_bytes, _ = build_private_tag_embed_bytes(
                             st.session_state.cf_original_bytes,
                             payload,
+                            include_launcher=selection.include_launcher,
                         )
-                    if selection.include_launcher and not selection.raw_embed_mode:
-                        out_bytes = append_autorun_launcher(out_bytes)
 
                 st.session_state.cf_embedded_bytes = out_bytes
-                st.session_state.cf_embedded_image = _try_load_image(out_bytes)
+                st.session_state.cf_embedded_image = _try_load_image(out_bytes) if file_kind == "dicom" else None
                 st.session_state.cf_embed_done = True
-                st.session_state.cf_last_embed_pattern = spec.embed_id
-                log_breach_event(
-                    action="DICOM Payload Embedded",
-                    data_type="steganography",
-                    data_accessed=(
-                        f"{spec.label} into {st.session_state.cf_source_name}; "
-                        f"endpoint=clean_flow"
-                    ),
-                    severity="CRITICAL",
-                    endpoint="clean_flow",
-                )
+
+                if file_kind == "image":
+                    stem = Path(st.session_state.cf_source_name or "image").stem
+                    ext = ".png" if st.session_state.cf_is_png else ".jpg"
+                    out_fname = f"{stem}_embedded{ext}"
+                    _save_embedded_output(out_bytes, out_fname)
+                    log_breach_event(
+                        action="Image File Embedded",
+                        data_type="steganography",
+                        data_accessed=f"Image stego into {st.session_state.cf_source_name}",
+                        severity="CRITICAL",
+                        endpoint="threat_embedder",
+                    )
+                else:
+                    st.session_state.cf_last_embed_pattern = spec.embed_id
+                    stem = Path(st.session_state.cf_source_name or "study").stem
+                    out_fname = f"{stem}_{spec.filename_suffix}.dcm"
+                    _save_embedded_output(out_bytes, out_fname)
+                    log_breach_event(
+                        action="DICOM Payload Embedded",
+                        data_type="steganography",
+                        data_accessed=(
+                            f"{spec.label} into {st.session_state.cf_source_name}; "
+                            f"endpoint=clean_flow"
+                        ),
+                        severity="CRITICAL",
+                        endpoint="clean_flow",
+                    )
             st.rerun()
         except Exception as error:
             st.error(f"Embed failed: {error}")
@@ -918,9 +1152,25 @@ def _render_dicom_embed() -> None:
         st.info(block_reason)
 
     _step_header(6, FLOW_STEPS[5], st.session_state.cf_embed_done)
-    if st.session_state.cf_embed_done and st.session_state.cf_last_embed_pattern == spec.embed_id:
-        preview = st.session_state.cf_embedded_image
-        if preview is not None:
+    embed_pattern = st.session_state.cf_last_embed_pattern
+    embed_matches = (
+        st.session_state.cf_embed_done
+        and (embed_pattern == spec.embed_id or (file_kind == "image" and embed_pattern == "pattern_image"))
+    )
+
+    if embed_matches:
+        if file_kind == "image" and st.session_state.cf_embedded_bytes:
+            raw_img = st.session_state.cf_original_bytes
+            emb_img = st.session_state.cf_embedded_bytes
+            added = len(emb_img) - len(raw_img)
+            st.success(f"Payload embedded — {len(raw_img):,} → {len(emb_img):,} bytes (+{added:,} hidden)")
+            col_before, col_after = st.columns(2)
+            with col_before:
+                st.image(raw_img, caption="Original", use_container_width=True)
+            with col_after:
+                st.image(emb_img, caption="Embedded (looks identical)", use_container_width=True)
+        elif st.session_state.cf_embedded_image is not None:
+            preview = st.session_state.cf_embedded_image
             display_emb, slice_info = _extract_2d_image(preview)
             cap = f"After embed — {spec.label}"
             if slice_info.get("is_volume"):
@@ -961,107 +1211,63 @@ def _render_dicom_embed() -> None:
         st.info("Complete earlier steps first.")
 
     _step_header(7, FLOW_STEPS[6], st.session_state.cf_embed_done)
-    if (
-        st.session_state.cf_embed_done
-        and st.session_state.cf_embedded_bytes
-        and st.session_state.cf_last_embed_pattern == spec.embed_id
-    ):
-        stem = Path(st.session_state.cf_source_name or "study").stem
-        out_name = f"{stem}_{spec.filename_suffix}.dcm"
+    if embed_matches and st.session_state.cf_embedded_bytes:
         emb = st.session_state.cf_embedded_bytes
+        out_name = st.session_state.cf_embedded_filename
 
-        if spec.embed_id == "pattern_exe":
+        if file_kind == "image":
+            if not out_name:
+                stem = Path(st.session_state.cf_source_name or "image").stem
+                ext = ".png" if st.session_state.cf_is_png else ".jpg"
+                out_name = f"{stem}_embedded{ext}"
+            mime = "image/png" if st.session_state.cf_is_png else "image/jpeg"
+            _render_post_embed_tools(out_name, emb, mime)
+
+        elif spec.embed_id == "pattern_exe":
+            stem = Path(st.session_state.cf_source_name or "study").stem
+            out_name = out_name or f"{stem}_{spec.filename_suffix}.dcm"
             include_launcher_exe = st.session_state.get("cf_exe_launcher", True)
             if include_launcher_exe:
-                st.success(
-                    f"**Double-click `{out_name}` directly** — payload runs automatically "
-                    "(DicomAutoOpen handler). Or rename to `.bat` for the polyglot demo."
+                st.info(
+                    f"Single polyglot `.dcm` file — opens in DICOM viewers **and** runs the "
+                    f"embedded script on double-click when the DicomAutoOpen handler is registered."
                 )
-            col_bat, col_dcm = st.columns(2)
-            with col_bat:
-                st.download_button(
-                    "⬇️ Download as .bat (polyglot demo)",
-                    emb,
-                    f"{stem}_polyglot.bat",
-                    "application/octet-stream",
-                    type="primary",
-                    key="cf_download_bat",
-                    width="stretch",
-                )
-                st.caption("Double-click → BAT preamble runs → Notepad/Chrome opens")
-            with col_dcm:
-                st.download_button(
-                    "⬇️ Download as .dcm (auto-run demo)",
-                    emb,
-                    out_name,
-                    "application/dicom",
-                    type="primary",
-                    key="cf_download_dcm",
-                    width="stretch",
-                )
-                st.caption("Double-click → DicomAutoOpen launcher → Notepad/Chrome opens")
-            st.caption(f"{len(emb):,} bytes · same file content — two ways to trigger the payload")
+            _render_post_embed_tools(out_name, emb, "application/dicom")
 
         else:
-            st.download_button(
-                "⬇️ Download Embedded DICOM",
-                emb,
-                out_name,
-                "application/dicom",
-                type="primary",
-                key="cf_download",
-                width="stretch",
-            )
-            st.caption(f"{len(emb):,} bytes · pattern: {spec.label}")
+            stem = Path(st.session_state.cf_source_name or "study").stem
+            out_name = out_name or f"{stem}_{spec.filename_suffix}.dcm"
 
-        if spec.embed_id == "pattern_pixel":
-            with st.container(border=True):
-                st.markdown("**How to extract and run the hidden payload**")
-                script_choice = st.session_state.get("cf_pixel_script_choice", "notepad_script")
-                include_launcher = st.session_state.get("cf_pixel_launcher", True)
-                if include_launcher and script_choice in ("notepad_script", "chrome_script", "file_lister_script"):
-                    st.success(
-                        f"**Double-click `{out_name}` directly** — the payload runs automatically "
-                        "(requires DicomAutoOpen file handler to be registered on the machine)."
-                    )
-                st.markdown(
-                    f"1. Download `{out_name}` — open in RadiAnt → looks like a **normal CT scan**\n"
-                    "2. **Double-click** the `.dcm` file → payload runs automatically\n"
-                    "   *(or go to Payload Extractor → scan → download `embedded.ps1` → run in PowerShell)*"
-                )
-                if script_choice == "notepad_script":
-                    st.info("Notepad opens with your custom warning message.")
-                elif script_choice == "chrome_script":
-                    st.info("Chrome opens 3 times.")
-                elif script_choice == "file_lister_script":
-                    st.info(
-                        "A dark-themed popup window opens listing files from Desktop, Documents, "
-                        "Downloads, Pictures, Music and Videos — showing what an attacker could silently access."
-                    )
+            if spec.embed_id == "pattern_pixel":
+                with st.container(border=True):
+                    st.markdown("**How to extract and run the hidden payload**")
+                    script_choice = st.session_state.get("cf_pixel_script_choice", "notepad_script")
+                    include_launcher = st.session_state.get("cf_pixel_launcher", True)
+                    if include_launcher and script_choice in ("notepad_script", "chrome_script", "file_lister_script"):
+                        st.success(
+                            f"**Double-click `{out_name}` directly** — the payload runs automatically "
+                            "(requires DicomAutoOpen file handler to be registered on the machine)."
+                        )
+                    if script_choice == "notepad_script":
+                        st.info("Notepad opens with your custom warning message.")
+                    elif script_choice == "chrome_script":
+                        st.info("Chrome opens multiple times.")
+                    elif script_choice == "file_lister_script":
+                        st.info("File lister popup shows user folder contents.")
 
-        elif spec.embed_id == "pattern_pdf":
-            with st.container(border=True):
-                st.markdown("**How to recover hidden files**")
-                st.markdown(
-                    f"1. Download `{out_name}`\n"
-                    "2. Go to **Payload Extractor** tab → upload → click Scan\n"
-                    "3. Download the hidden file(s) found after PDF `%%EOF`\n\n"
-                    "Or go to **DICOM Safety Validator** to detect and cleanly remove the threat."
-                )
+            elif spec.embed_id == "pattern_pdf":
+                with st.container(border=True):
+                    st.markdown("**How to recover hidden files**")
+                    st.caption("Use Payload Extractor or DICOM Safety Validator on the downloaded file.")
+
+            _render_post_embed_tools(out_name, emb, "application/dicom")
     else:
         st.info("Embed step must finish before download is available.")
 
 
 def render_clean_flow() -> None:
     _init_state()
-
-    tab_dicom, tab_image = st.tabs(["🏥 DICOM Embed", "🖼️ Image File Embed (PNG / JPG)"])
-
-    with tab_image:
-        _render_image_file_embed()
-
-    with tab_dicom:
-        _render_dicom_embed()
+    _render_unified_embed()
 
 
 def _build_pdf(
