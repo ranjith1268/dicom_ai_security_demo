@@ -28,6 +28,14 @@ if sys.platform == "win32":
     if not _handler_ok and "app_handler_warned" not in st.session_state:
         st.session_state.app_handler_warned = True
         st.sidebar.caption(f"⚠️ {_handler_msg}")
+    try:
+        from utils.defender_bridge import try_start_defender_bridge_background
+
+        if try_start_defender_bridge_background():
+            if "defender_bridge_started" not in st.session_state:
+                st.session_state.defender_bridge_started = True
+    except Exception:
+        pass
 
 st.title("DICOM Security Research Platform")
 st.caption(

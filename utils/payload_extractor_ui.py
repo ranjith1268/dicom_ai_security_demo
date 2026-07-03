@@ -158,7 +158,12 @@ def render_payload_extractor() -> None:
                 )
             elif name.endswith(".ps1"):
                 st.caption(
-                    f"To run: `powershell -ExecutionPolicy Bypass -File {name}`"
+                    f"To run locally: `powershell -ExecutionPolicy Bypass -File {name}`"
+                )
+                st.caption(
+                    "Windows may warn this file came from the internet (Mark of the Web). "
+                    "That is expected for browser downloads. Before running: "
+                    f"`Unblock-File -LiteralPath .\\{name}` or right-click the saved file → **Unblock**."
                 )
             elif method == "exe_polyglot" and name.endswith(".bat"):
                 st.success(

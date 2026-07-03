@@ -13,6 +13,7 @@ from utils.embed_engine import (
     FILE_MAGIC,
     SCRIPT_MAGIC,
     dicom_structure_end,
+    find_eof_embed_start,
 )
 
 PRIVATE_CREATOR = "DEMO_EMBED"
@@ -124,6 +125,15 @@ def _parse_file_payload(data: bytes, offset: int = 0) -> Optional[Tuple[str, byt
     return filename, data[file_start:file_end], file_end
 
 
+def _script_display_name(script: bytes, default: str = "embedded_script.ps1") -> str:
+    """Use # OriginalFilename: comment when present; otherwise default label."""
+    header = script[:256].decode("utf-8", errors="replace")
+    for line in header.splitlines():
+        if line.startswith("# OriginalFilename:"):
+            return line.split(":", 1)[1].strip() or default
+    return default
+
+
 def _scan_raw_for_payloads(raw: bytes) -> List[Dict[str, Any]]:
     found: List[Dict[str, Any]] = []
     offset = 0
@@ -133,7 +143,12 @@ def _scan_raw_for_payloads(raw: bytes) -> List[Dict[str, Any]]:
             if not parsed:
                 break
             script, next_offset = parsed
-            found.append({"type": "script", "name": "embedded.ps1", "data": script, "offset": offset})
+            found.append({
+                "type": "script",
+                "name": _script_display_name(script, "embedded.ps1"),
+                "data": script,
+                "offset": offset,
+            })
             offset = next_offset
             continue
         if raw[offset:].startswith(FILE_MAGIC):
@@ -214,6 +229,79 @@ def extract_from_pdf_encapsulated(ds: pydicom.Dataset) -> List[Dict[str, Any]]:
     return results
 
 
+def _is_script_magic_in_launcher_source(raw: bytes, offset: int) -> bool:
+    """False positive when SCRIPT_MAGIC appears inside launcher PS1 source text."""
+    window = raw[max(0, offset - 48) : offset + len(SCRIPT_MAGIC) + 8]
+    return b"GetBytes" in window or b"ASCII.GetBytes" in window
+
+
+def extract_from_eof_markers(dicom_bytes: bytes) -> List[Dict[str, Any]]:
+    """Find demo SCRIPT/FILE blocks appended after the original DICOM bytes."""
+    from utils.embed_engine import _is_valid_script_block
+
+    results: List[Dict[str, Any]] = []
+    embed_start = find_eof_embed_start(dicom_bytes)
+    if embed_start >= len(dicom_bytes):
+        return results
+
+    launcher_idx = dicom_bytes.rfind(FILE_LAUNCHER_MAGIC, embed_start)
+    payload_end = launcher_idx if launcher_idx >= embed_start else len(dicom_bytes)
+    region = dicom_bytes[embed_start:payload_end]
+
+    offset = 0
+    while offset < len(region):
+        abs_offset = embed_start + offset
+        if region[offset:].startswith(SCRIPT_MAGIC):
+            if not _is_valid_script_block(dicom_bytes, abs_offset):
+                offset += 1
+                continue
+            parsed = _parse_script_payload(dicom_bytes, abs_offset)
+            if not parsed:
+                break
+            script, next_abs = parsed
+            name = _script_display_name(script)
+            results.append({
+                "type": "script",
+                "name": name,
+                "data": script,
+                "method": "eof_script",
+                "offset": abs_offset,
+                "description": f"PowerShell script — {len(script):,} bytes after DICOM EOF",
+            })
+            offset = next_abs - embed_start
+            continue
+        if region[offset:].startswith(FILE_MAGIC):
+            parsed = _parse_file_payload(dicom_bytes, abs_offset)
+            if not parsed:
+                break
+            filename, file_bytes, next_abs = parsed
+            results.append({
+                "type": "file",
+                "name": filename,
+                "data": file_bytes,
+                "method": "eof_tail",
+                "offset": abs_offset,
+                "description": f"Embedded file — {len(file_bytes):,} bytes after DICOM EOF",
+            })
+            offset = next_abs - embed_start
+            continue
+        offset += 1
+
+    if launcher_idx >= embed_start:
+        launcher = dicom_bytes[launcher_idx + len(FILE_LAUNCHER_MAGIC) :]
+        if launcher.strip():
+            results.append({
+                "type": "launcher",
+                "name": "eof_launcher.ps1",
+                "data": launcher,
+                "method": "eof_tail",
+                "offset": launcher_idx,
+                "description": "Auto-run launcher appended after embedded script",
+            })
+
+    return results
+
+
 def extract_polyglot_stub(dicom_bytes: bytes) -> List[Dict[str, Any]]:
     """Detect preamble payloads before DICM (EXE polyglot and BAT polyglot patterns)."""
     if len(dicom_bytes) < 132 or dicom_bytes[128:132] != b"DICM":
@@ -258,6 +346,9 @@ def extract_embedded_items(dicom_bytes: bytes) -> List[Dict[str, Any]]:
     results.extend(extract_from_private_tag(ds))
     results.extend(extract_from_pdf_encapsulated(ds))
 
+    eof_marker_items = extract_from_eof_markers(dicom_bytes)
+    results.extend(eof_marker_items)
+
     if hasattr(ds, "PixelData"):
         pixel_bytes = bytes(ds.PixelData)
         expected = _expected_pixel_bytes(ds)
@@ -301,7 +392,7 @@ def extract_embedded_items(dicom_bytes: bytes) -> List[Dict[str, Any]]:
 
     dicom_len = dicom_structure_end(dicom_bytes)
     eof_tail = dicom_bytes[dicom_len:]
-    if eof_tail:
+    if eof_tail and not any(i.get("method") in ("eof_script", "eof_tail") for i in results):
         launcher_idx = eof_tail.find(FILE_LAUNCHER_MAGIC)
         script_region = eof_tail[:launcher_idx] if launcher_idx >= 0 else eof_tail
         launcher_region = eof_tail[launcher_idx:] if launcher_idx >= 0 else b""
@@ -319,10 +410,21 @@ def extract_embedded_items(dicom_bytes: bytes) -> List[Dict[str, Any]]:
             item["method"] = "eof_script" if item.get("type") == "script" else "eof_tail"
             results.append(item)
 
-    # De-duplicate by offset+name
+    # De-duplicate by offset+name and drop pixel-tail copies already found via EOF scan
     seen = set()
+    eof_script_data = {
+        bytes(i["data"])
+        for i in results
+        if i.get("method") == "eof_script" and i.get("type") == "script"
+    }
     unique: List[Dict[str, Any]] = []
     for item in results:
+        if (
+            item.get("method") == "pixel_tail"
+            and item.get("type") == "script"
+            and bytes(item.get("data", b"")) in eof_script_data
+        ):
+            continue
         key = (item.get("method"), item.get("name"), item.get("offset"))
         if key in seen:
             continue

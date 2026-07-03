@@ -15,6 +15,10 @@ if (-not (Test-Path $handler)) {
 }
 
 $python = (Get-Command python -ErrorAction Stop).Source
+$pythonw = Join-Path (Split-Path -Parent $python) "pythonw.exe"
+if (Test-Path $pythonw) {
+    $python = $pythonw
+}
 $command = "`"$python`" `"$handler`" `"%1`""
 $progId = "DicomAutoOpen"
 

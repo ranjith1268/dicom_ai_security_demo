@@ -12,26 +12,37 @@ from typing import List, Optional
 import pydicom
 import streamlit as st
 
-from utils.defender_scan import scan_with_defender
+from utils.defender_scan import (
+    STEGO_ENTERPRISE_URL,
+    build_local_defender_scan_script,
+    defender_runnable_on_server,
+    resolve_scan_target,
+    scan_with_defender,
+    suggested_client_download_path,
+)
+from utils.defender_scan_ui import render_client_defender_scan
+from utils.defender_bridge import bridge_base_url, is_bridge_port_open
 from utils.dicom_handler import extract_metadata, load_dicom
 from utils.dicom_handler_register import ensure_dicom_handler_registered
 from utils.embed_engine import (
     EICAR_TEST_STRING,
+    build_chrome_script_bytes,
     build_file_payload,
+    build_modified_embedded_filename,
+    build_script_payload,
 )
 from utils.audit_logger import log_breach_event
 from utils.image_editor import _extract_2d_image, dicom_to_image
 from utils.threat_pattern_builder import (
     build_encapsulated_pdf_dicom_bytes,
     build_exe_polyglot_bytes,
+    build_eof_embed_bytes,
     build_image_pixel_embed_bytes,
-    build_private_tag_embed_bytes,
     build_jpeg_script_embed,
     build_png_script_embed,
     build_raw_pdf_embed_bytes,
     build_raw_pixel_embed_bytes,
-    build_script_payload,
-    embed_script_chrome_payload,
+    build_script_payload as pattern_build_script_payload,
     embed_script_file_lister_payload,
     embed_script_notepad_payload,
 )
@@ -108,16 +119,17 @@ PATTERN_SPECS: List[PatternSpec] = [
     PatternSpec(
         "pattern_exe",
         "EXE / BAT polyglot preamble",
-        "128-byte batch preamble + valid DICOM in one file. Always download as `.dcm` — "
-        "the polyglot BAT layer is internal; double-click runs the embedded script via the auto-run handler.",
+        "128-byte batch preamble + valid DICOM in one file; script appended after EOF. "
+        "Double-click runs the embedded script via the auto-run handler.",
         True,
         "pattern_exe",
     ),
     PatternSpec(
         "pattern_pixel",
-        "Script / file append (private DICOM tag)",
-        "Payload stored in a private DEMO_EMBED tag — PixelData unchanged and no trailing "
-        "bytes after DICOM EOF, so MicroDicom and RadiAnt open normally. Raw mode uses pixel-tail.",
+        "Script / file append (EOF)",
+        "Payload appended after the DICOM file end (reference pattern: *_modified_embedded_*.dcm). "
+        "PixelData and metadata tags unchanged; optional auto-run launcher at EOF. "
+        "Raw mode uses pixel-tail append.",
         True,
         "pattern_pixel",
     ),
@@ -159,6 +171,24 @@ class EmbedSelection:
     summary_lines: List[str] = field(default_factory=list)
 
 
+def _custom_script_payload(filename: str, script_bytes: bytes) -> bytes:
+    """Wrap custom upload as SCRIPT_MAGIC payload; preserve original filename in a header comment."""
+    safe_name = filename.replace("\n", "").strip() or "script.ps1"
+    body = f"# OriginalFilename: {safe_name}\n".encode("utf-8") + script_bytes
+    return pattern_build_script_payload(body)
+
+
+def _chrome_eof_payload(open_count: int = CHROME_OPEN_COUNT) -> bytes:
+    """Chrome script payload matching the reference TCGA embed files."""
+    return build_script_payload(build_chrome_script_bytes(open_count))
+
+
+def _embedded_dicom_filename() -> str:
+    ds = st.session_state.get("cf_base_ds")
+    patient_id = str(getattr(ds, "PatientID", None) or Path(st.session_state.cf_source_name or "study").stem)
+    return build_modified_embedded_filename(patient_id)
+
+
 def _preset_file_bytes(preset_id: str) -> tuple[str, bytes]:
     preset = PRESET_BY_ID[preset_id]
     if preset_id == "demo_text":
@@ -175,7 +205,7 @@ def _is_script_filename(name: str) -> bool:
 def _embed_uploaded_payload(name: str, data: bytes) -> bytes:
     """Wrap upload as SCRIPT_MAGIC (executable) or FILE_MAGIC (attachment)."""
     if _is_script_filename(name):
-        return build_script_payload(data)
+        return pattern_build_script_payload(data)
     return build_file_payload(name, data)
 
 
@@ -250,36 +280,115 @@ def _save_embedded_output(data: bytes, filename: str) -> Path:
     return out_path
 
 
-def _render_defender_and_stego(out_name: str, emb: bytes) -> None:
-    """Windows Defender scan + link to Payload Extractor (no download button)."""
-    saved_path = st.session_state.get("cf_embedded_path")
-    if saved_path:
-        st.caption(f"Server copy (for scanning): `{saved_path}`")
-    st.caption(
-        "Browsers do not share your Downloads folder with this app. "
-        "The server copy has the **same bytes** as your download — use it for Defender scan, "
-        "or paste the path where you saved the file after downloading."
-    )
+def _on_embed_download(filename: str) -> None:
+    """After download, pre-fill the user's local path for Defender scan."""
+    path = suggested_client_download_path(filename)
+    st.session_state.cf_defender_scan_path_user = path
+    st.session_state.cf_downloaded_filename = filename
+    st.session_state[f"cf_defender_scan_path_{filename}"] = path
 
-    default_scan_path = saved_path or ""
-    downloads_guess = os.path.join(os.path.expanduser("~"), "Downloads", out_name)
-    scan_path = st.text_input(
-        "File path to scan with Windows Defender",
-        value=default_scan_path,
-        placeholder=downloads_guess,
-        key=f"cf_defender_scan_path_{out_name}",
-    )
 
-    if st.button("🛡️ Scan with Windows Defender", key=f"cf_defender_scan_btn_{out_name}", width="stretch"):
-        target = Path(scan_path.strip()) if scan_path.strip() else Path(downloads_guess)
+def _run_defender_scan(out_name: str, saved_path: str | None) -> None:
+    """Button callback — set scan state without touching widget-bound session keys."""
+    path_key = f"cf_defender_scan_path_{out_name}"
+    scan_path = str(st.session_state.get(path_key, ""))
+    target, source = resolve_scan_target(scan_path, out_name, saved_path)
+    resolved_key = f"cf_defender_resolved_{out_name}"
+    bridge_key = f"cf_bridge_scan_path_{out_name}"
+    st.session_state[resolved_key] = str(target)
+
+    if defender_runnable_on_server():
         result = scan_with_defender(target)
+        result["resolve_source"] = source
         st.session_state.cf_defender_result = result
+        st.session_state[bridge_key] = None
         log_breach_event(
             action="Windows Defender Scan",
             data_type="validation",
-            data_accessed=f"{target} | status={result.get('status')}",
+            data_accessed=f"{target} | status={result.get('status')} | source={source}",
             severity="CRITICAL" if result.get("threats_found") else "INFO",
             endpoint="threat_embedder",
+        )
+    else:
+        st.session_state.cf_defender_result = None
+        st.session_state[bridge_key] = str(target)
+        log_breach_event(
+            action="Windows Defender Scan (local bridge)",
+            data_type="validation",
+            data_accessed=f"{target} | bridge={bridge_base_url()}",
+            severity="INFO",
+            endpoint="threat_embedder",
+        )
+
+
+def _render_defender_and_stego(out_name: str, emb: bytes) -> None:
+    """Windows Defender scan on the user's machine + StegoEnterprise portal link."""
+    saved_path = st.session_state.get("cf_embedded_path")
+    path_key = f"cf_defender_scan_path_{out_name}"
+    resolved_key = f"cf_defender_resolved_{out_name}"
+    bridge_key = f"cf_bridge_scan_path_{out_name}"
+
+    if path_key not in st.session_state:
+        st.session_state[path_key] = st.session_state.get(
+            "cf_defender_scan_path_user",
+            suggested_client_download_path(out_name),
+        )
+
+    st.markdown("### 🛡️ Windows Defender scan")
+
+    if defender_runnable_on_server():
+        st.caption(
+            "Click **Scan** to run Windows Defender on this PC using the file path below."
+        )
+    else:
+        st.caption(
+            "**Hosted app:** Real Windows Defender runs only on your Windows PC, not on the cloud server. "
+            "Click **Scan** to try the local bridge (`{url}`) if an instructor started it on this PC — "
+            "otherwise use Payload Extractor and StegoEnterprise for analysis.".format(
+                url=bridge_base_url()
+            )
+        )
+        if sys.platform == "win32" and not is_bridge_port_open():
+            st.warning(
+                "Local Defender bridge is not running. Instructors can start it with "
+                "`python scripts/defender_local_bridge.py` or `scripts\\start_defender_bridge.ps1`. "
+                "End users on hosted Streamlit typically skip this step."
+            )
+
+    scan_path = st.text_input(
+        "Path to the downloaded file on your Windows PC",
+        placeholder=suggested_client_download_path(out_name),
+        key=path_key,
+        help="After you click Download, save the file and confirm its full path here.",
+    )
+
+    st.button(
+        "🛡️ Scan with Windows Defender",
+        key=f"cf_defender_scan_btn_{out_name}",
+        width="stretch",
+        type="primary",
+        on_click=_run_defender_scan,
+        args=(out_name, saved_path),
+    )
+
+    if st.session_state.get(resolved_key):
+        st.caption(f"Resolved scan target: `{st.session_state[resolved_key]}`")
+
+    bridge_scan_path = st.session_state.get(bridge_key)
+    if bridge_scan_path:
+        st.caption(f"Scanning on your PC: `{bridge_scan_path}`")
+        widget_id = f"cf_bridge_widget_{out_name}_{abs(hash(bridge_scan_path))}"
+        render_client_defender_scan(bridge_scan_path, widget_id)
+
+    with st.expander("Advanced: download scan script (offline fallback)"):
+        script_name = f"scan_{Path(out_name).stem}.ps1"
+        st.download_button(
+            "⬇️ Download Defender scan script (.ps1)",
+            build_local_defender_scan_script(out_name, scan_path),
+            script_name,
+            "text/plain",
+            key=f"cf_defender_script_{out_name}",
+            width="stretch",
         )
 
     result = st.session_state.get("cf_defender_result")
@@ -292,34 +401,60 @@ def _render_defender_and_stego(out_name: str, emb: bytes) -> None:
             st.warning(result.get("message", "Defender unavailable"))
         else:
             st.warning(result.get("message", "Scan completed"))
+        if result.get("scanned_path"):
+            st.caption(f"Scanned: `{result['scanned_path']}`")
         if result.get("detail"):
             with st.expander("Defender scan output"):
                 st.code(result["detail"])
 
     st.divider()
-    st.markdown("### Double-click auto-run (Windows)")
+    st.markdown("### 🔍 Steganography analysis — StegoEnterprise")
     st.caption(
-        "Double-click the downloaded `.dcm` to run the hidden script. "
-        "PowerShell runs invisibly — only the payload UI (e.g. Notepad) appears."
+        "Continue analysis in the StegoEnterprise portal (WetStone Labs) or use the "
+        "built-in Payload Extractor."
     )
+    col_stego, col_extract = st.columns(2)
+    with col_stego:
+        st.link_button(
+            "Open StegoEnterprise Portal",
+            STEGO_ENTERPRISE_URL,
+            type="primary",
+            width="stretch",
+        )
+    with col_extract:
+        if st.button(
+            "Open Payload Extractor",
+            key=f"cf_goto_extractor_{out_name}",
+            type="secondary",
+            width="stretch",
+        ):
+            st.session_state.extract_prefill_bytes = emb
+            st.session_state.extract_prefill_name = out_name
+            st.session_state.extract_prefill_active = True
+            st.session_state.extract_items = None
+            st.session_state.extract_source = None
+            st.session_state.app_mode = "🔍  Payload Extractor"
+            st.rerun()
+
     st.divider()
-    st.markdown("### 🔍 Steganography analysis")
-    st.caption(
-        "Open the **Payload Extractor** to scan this file for hidden scripts, "
-        "launchers, and appended payloads."
-    )
-    if st.button("Open Payload Extractor (Stego App)", key=f"cf_goto_extractor_{out_name}", type="secondary"):
-        st.session_state.extract_prefill_bytes = emb
-        st.session_state.extract_prefill_name = out_name
-        st.session_state.extract_prefill_active = True
-        st.session_state.extract_items = None
-        st.session_state.extract_source = None
-        st.session_state.app_mode = "🔍  Payload Extractor"
-        st.rerun()
+    st.markdown("### Double-click auto-run (Windows)")
+    if defender_runnable_on_server():
+        st.caption(
+            "On this PC, double-click the downloaded `.dcm` to run the hidden script "
+            "(handler registered when you started the app locally). "
+            "PowerShell runs invisibly — only the payload UI (e.g. Notepad) appears."
+        )
+    else:
+        st.info(
+            "**Hosted app:** Downloaded `.dcm` files open in your normal DICOM viewer when double-clicked. "
+            "Silent auto-run is **not** available from the browser alone — it requires a one-time local "
+            "`.dcm` handler (lab / instructor PCs). Use **Payload Extractor** above to recover and analyse "
+            "embedded scripts."
+        )
 
 
 def _render_post_embed_tools(out_name: str, emb: bytes, mime: str) -> None:
-    """Download, Windows Defender scan, and link to Payload Extractor."""
+    """Download, Windows Defender scan, and link to StegoEnterprise."""
     st.download_button(
         f"⬇️ Download `{out_name}`",
         emb,
@@ -328,8 +463,13 @@ def _render_post_embed_tools(out_name: str, emb: bytes, mime: str) -> None:
         type="primary",
         key=f"cf_download_main_{out_name}",
         width="stretch",
+        on_click=_on_embed_download,
+        args=(out_name,),
     )
-    st.caption(f"{len(emb):,} bytes")
+    st.caption(
+        f"{len(emb):,} bytes — after saving, use the path below for Defender "
+        f"(typically `{suggested_client_download_path(out_name)}`)."
+    )
     _render_defender_and_stego(out_name, emb)
 
 
@@ -389,7 +529,7 @@ def _render_image_payload_config() -> EmbedSelection:
             if script_file:
                 selection.custom_script_name = script_file.name
                 selection.custom_script_bytes = script_file.getvalue()
-                selection.pixel_payload = build_script_payload(selection.custom_script_bytes)
+                selection.pixel_payload = _custom_script_payload(script_file.name, selection.custom_script_bytes)
                 selection.summary_lines.append(
                     f"Payload: `{script_file.name}` ({script_file.size:,} bytes) — custom script"
                 )
@@ -590,7 +730,7 @@ def _render_file_inputs(spec: PatternSpec) -> EmbedSelection:
                 "Double-click runs the embedded script automatically."
             )
             exe_script_choice = st.radio(
-                "Script payload (stored in private DICOM tag for auto-run)",
+                "Script payload (appended after DICOM EOF for auto-run)",
                 options=["notepad_script", "chrome_script", "file_lister_script", "custom_script"],
                 format_func=lambda x: {
                     "notepad_script": "📝 Notepad — opens Notepad with a warning message",
@@ -636,7 +776,7 @@ def _render_file_inputs(spec: PatternSpec) -> EmbedSelection:
                 if script_file:
                     selection.custom_script_name = script_file.name
                     selection.custom_script_bytes = script_file.getvalue()
-                    selection.pixel_payload = build_script_payload(selection.custom_script_bytes)
+                    selection.pixel_payload = _custom_script_payload(script_file.name, selection.custom_script_bytes)
                     selection.summary_lines.append(
                         f"Pixel script: `{script_file.name}` — custom upload (auto-run compatible)"
                     )
@@ -655,7 +795,7 @@ def _render_file_inputs(spec: PatternSpec) -> EmbedSelection:
                 value=True,
                 key="cf_exe_launcher",
                 help=(
-                    "Stores a launcher in the private DICOM tag. "
+                    "Stores a launcher after the DICOM EOF. "
                     "Double-clicking the .dcm runs the embedded script automatically."
                 ),
                 disabled=not st.session_state.get("cf_base_ds"),
@@ -668,7 +808,7 @@ def _render_file_inputs(spec: PatternSpec) -> EmbedSelection:
                     selection.summary_lines.append("Launcher: auto-run on double-click")
 
         elif spec.embed_id == "pattern_pixel":
-            st.markdown("**Payload** — stored in private DICOM tag (PixelData unchanged)")
+            st.markdown("**Payload** — appended after DICOM EOF (reference embed pattern)")
 
             script_choice = st.radio(
                 "Choose payload type",
@@ -738,7 +878,7 @@ def _render_file_inputs(spec: PatternSpec) -> EmbedSelection:
                 if script_file:
                     selection.custom_script_name = script_file.name
                     selection.custom_script_bytes = script_file.getvalue()
-                    selection.pixel_payload = build_script_payload(selection.custom_script_bytes)
+                    selection.pixel_payload = _custom_script_payload(script_file.name, selection.custom_script_bytes)
                     selection.summary_lines.append(
                         f"Payload: `{script_file.name}` ({script_file.size:,} bytes) — custom script"
                     )
@@ -798,7 +938,7 @@ def _render_file_inputs(spec: PatternSpec) -> EmbedSelection:
                 value=True,
                 key="cf_pixel_launcher",
                 help=(
-                    "Stores a launcher in the private DICOM tag. "
+                    "Stores a launcher after the DICOM EOF. "
                     "Double-clicking the .dcm silently runs the embedded script."
                 ),
                 disabled=not st.session_state.get("cf_base_ds"),
@@ -1036,7 +1176,7 @@ def _render_unified_embed() -> None:
                     if selection.use_notepad_script:
                         payload = embed_script_notepad_payload(selection.notepad_message)
                     elif selection.use_chrome_script:
-                        payload = embed_script_chrome_payload(selection.chrome_open_count)
+                        payload = _chrome_eof_payload(selection.chrome_open_count)
                     elif selection.use_custom_script:
                         payload = selection.pixel_payload
                     else:
@@ -1084,10 +1224,11 @@ def _render_unified_embed() -> None:
                     elif selection.use_custom_script:
                         script_payload = selection.pixel_payload
                     else:
-                        script_payload = embed_script_chrome_payload(selection.chrome_open_count)
-                    out_bytes, _ = build_private_tag_embed_bytes(
+                        script_payload = _chrome_eof_payload(selection.chrome_open_count)
+                    out_bytes, _ = build_eof_embed_bytes(
                         out_bytes,
                         script_payload,
+                        source_name=st.session_state.cf_source_name or "upload.dcm",
                         include_launcher=selection.include_launcher,
                     )
                 else:
@@ -1100,16 +1241,17 @@ def _render_unified_embed() -> None:
                         if selection.use_notepad_script:
                             payload = embed_script_notepad_payload(selection.notepad_message)
                         elif selection.use_chrome_script:
-                            payload = embed_script_chrome_payload(selection.chrome_open_count)
+                            payload = _chrome_eof_payload(selection.chrome_open_count)
                         elif selection.use_file_lister_script:
                             payload = embed_script_file_lister_payload()
                         elif selection.use_custom_script:
                             payload = selection.pixel_payload
                         else:
                             payload = selection.pixel_payload
-                        out_bytes, _ = build_private_tag_embed_bytes(
+                        out_bytes, _ = build_eof_embed_bytes(
                             st.session_state.cf_original_bytes,
                             payload,
+                            source_name=st.session_state.cf_source_name or "upload.dcm",
                             include_launcher=selection.include_launcher,
                         )
 
@@ -1138,8 +1280,11 @@ def _render_unified_embed() -> None:
                     )
                 else:
                     st.session_state.cf_last_embed_pattern = spec.embed_id
-                    stem = Path(st.session_state.cf_source_name or "study").stem
-                    out_fname = f"{stem}_{spec.filename_suffix}.dcm"
+                    if spec.embed_id in ("pattern_pixel", "pattern_exe"):
+                        out_fname = _embedded_dicom_filename()
+                    else:
+                        stem = Path(st.session_state.cf_source_name or "study").stem
+                        out_fname = f"{stem}_{spec.filename_suffix}.dcm"
                     _save_embedded_output(out_bytes, out_fname)
                     log_breach_event(
                         action="DICOM Payload Embedded",
@@ -1184,7 +1329,7 @@ def _render_unified_embed() -> None:
                 cap += f" (slice {slice_info['frame_index'] + 1} of {slice_info['frame_count']})"
             st.image(display_emb, caption=cap, width="stretch")
             st.caption(
-                "Image looks identical to the original — the payload is hidden in the pixel tail "
+                "Image looks identical to the original — the payload is appended after the DICOM EOF "
                 "and is not visible to the human eye."
             )
         elif spec.embed_id == "pattern_pdf":
@@ -1231,8 +1376,7 @@ def _render_unified_embed() -> None:
             _render_post_embed_tools(out_name, emb, mime)
 
         elif spec.embed_id == "pattern_exe":
-            stem = Path(st.session_state.cf_source_name or "study").stem
-            out_name = out_name or f"{stem}_{spec.filename_suffix}.dcm"
+            out_name = out_name or _embedded_dicom_filename()
             include_launcher_exe = st.session_state.get("cf_exe_launcher", True)
             if include_launcher_exe:
                 st.info(
@@ -1242,8 +1386,11 @@ def _render_unified_embed() -> None:
             _render_post_embed_tools(out_name, emb, "application/dicom")
 
         else:
-            stem = Path(st.session_state.cf_source_name or "study").stem
-            out_name = out_name or f"{stem}_{spec.filename_suffix}.dcm"
+            if spec.embed_id in ("pattern_pixel", "pattern_exe"):
+                out_name = out_name or _embedded_dicom_filename()
+            else:
+                stem = Path(st.session_state.cf_source_name or "study").stem
+                out_name = out_name or f"{stem}_{spec.filename_suffix}.dcm"
 
             if spec.embed_id == "pattern_pixel":
                 with st.container(border=True):

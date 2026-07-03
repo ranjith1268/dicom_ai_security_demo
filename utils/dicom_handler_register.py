@@ -8,6 +8,16 @@ from pathlib import Path
 PROG_ID = "DicomAutoOpen"
 
 
+def handler_python_executable() -> Path:
+    """Prefer pythonw.exe so double-click does not flash a console window."""
+    exe = Path(sys.executable)
+    if exe.stem.lower() == "python":
+        pyw = exe.with_name("pythonw.exe")
+        if pyw.is_file():
+            return pyw
+    return exe
+
+
 def is_dicom_handler_registered() -> bool:
     if sys.platform != "win32":
         return False
@@ -30,7 +40,7 @@ def register_dicom_handler() -> tuple[bool, str]:
     if not handler.is_file():
         return False, f"Handler not found: {handler}"
 
-    python = Path(sys.executable)
+    python = handler_python_executable()
     command = f'"{python}" "{handler}" "%1"'
 
     try:
