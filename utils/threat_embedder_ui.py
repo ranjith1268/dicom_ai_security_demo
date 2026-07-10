@@ -1110,7 +1110,7 @@ def _render_unified_embed() -> None:
         st.image(
             st.session_state.cf_original_bytes,
             caption=f"Original — {st.session_state.cf_source_name}",
-            use_container_width=True,
+            width="stretch",
         )
     elif has_image_preview:
         display_img, slice_info = _extract_2d_image(st.session_state.cf_original_image)
@@ -1318,9 +1318,9 @@ def _render_unified_embed() -> None:
             st.success(f"Payload embedded — {len(raw_img):,} → {len(emb_img):,} bytes (+{added:,} hidden)")
             col_before, col_after = st.columns(2)
             with col_before:
-                st.image(raw_img, caption="Original", use_container_width=True)
+                st.image(raw_img, caption="Original", width="stretch")
             with col_after:
-                st.image(emb_img, caption="Embedded (looks identical)", use_container_width=True)
+                st.image(emb_img, caption="Embedded (looks identical)", width="stretch")
         elif st.session_state.cf_embedded_image is not None:
             preview = st.session_state.cf_embedded_image
             display_emb, slice_info = _extract_2d_image(preview)
