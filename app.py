@@ -3,18 +3,40 @@ import sys
 
 sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
 
+_DEBUG_IMPORTS = os.environ.get("DICOM_DEMO_DEBUG_IMPORTS", "1") == "1"
+
+
+def _step(label):
+    if _DEBUG_IMPORTS:
+        print(f"[import-debug] {label}", file=sys.stderr, flush=True)
+
+
+_step("start")
 import streamlit as st
+_step("streamlit imported")
+import numpy as np
+_step("numpy imported")
+import cv2
+_step("cv2 imported")
+import pydicom
+_step("pydicom imported")
 from utils.threat_embedder_ui import render_clean_flow
+_step("threat_embedder_ui imported")
 from utils.payload_extractor_ui import render_payload_extractor
+_step("payload_extractor_ui imported")
 from utils.safety_validator_ui import render_dicom_cleaner
+_step("safety_validator_ui imported")
 from utils.auth import require_login, render_user_bar
+_step("auth imported")
 from utils.dicom_handler_register import ensure_dicom_handler_registered
+_step("dicom_handler_register imported")
 from utils.audit_logger import (
     get_breach_logs,
     clear_breach_logs,
     logs_to_csv,
     count_by_severity,
 )
+_step("audit_logger imported")
 
 st.set_page_config(
     page_title="DICOM Security Demo",
