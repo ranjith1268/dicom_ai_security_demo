@@ -75,7 +75,7 @@ def render_payload_extractor() -> None:
     is_image_file = fname.lower().endswith((".png", ".jpg", ".jpeg"))
 
     if is_image_file:
-        st.image(raw, caption=f"Uploaded — {fname}", use_container_width=True)
+        st.image(raw, caption=f"Uploaded — {fname}", width="stretch")
     else:
         try:
             ds = load_dicom(io.BytesIO(raw))
@@ -92,7 +92,7 @@ def render_payload_extractor() -> None:
                 cap = f"Uploaded DICOM — {fname}"
                 if slice_info.get("is_volume"):
                     cap += f" (slice {slice_info['frame_index'] + 1}/{slice_info['frame_count']})"
-                st.image(display, caption=cap, use_container_width=True)
+                st.image(display, caption=cap, width="stretch")
             except Exception:
                 st.info("No image preview available for this DICOM (may be encapsulated PDF or no PixelData).")
         with col_meta:

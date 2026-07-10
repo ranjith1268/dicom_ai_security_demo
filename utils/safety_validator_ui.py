@@ -106,7 +106,7 @@ def render_dicom_cleaner() -> None:
                 cap = f"Uploaded — {uploaded.name}"
                 if slice_info.get("is_volume"):
                     cap += f" (slice {slice_info['frame_index'] + 1}/{slice_info['frame_count']})"
-                st.image(display, caption=cap, use_container_width=True)
+                st.image(display, caption=cap, width="stretch")
             except Exception:
                 st.info("No image preview (encapsulated PDF / no PixelData).")
         with col_meta:
@@ -175,7 +175,7 @@ def render_dicom_cleaner() -> None:
                 ds_before = load_dicom(io.BytesIO(raw))
                 img_before = dicom_to_image(ds_before)
                 disp_before, _ = _extract_2d_image(img_before)
-                st.image(disp_before, caption="Original (with threats)", use_container_width=True)
+                st.image(disp_before, caption="Original (with threats)", width="stretch")
             except Exception:
                 st.info("No image preview.")
         with col_after:
@@ -184,7 +184,7 @@ def render_dicom_cleaner() -> None:
                 ds_after = load_dicom(io.BytesIO(cleaned_bytes))
                 img_after = dicom_to_image(ds_after)
                 disp_after, _ = _extract_2d_image(img_after)
-                st.image(disp_after, caption="Cleaned DICOM", use_container_width=True)
+                st.image(disp_after, caption="Cleaned DICOM", width="stretch")
             except Exception:
                 st.info("No image preview.")
 
