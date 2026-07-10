@@ -116,6 +116,6 @@ if breach_logs:
         }
         for row in breach_logs
     ]
-    st.dataframe(display_rows, use_container_width=True)
+    st.dataframe(display_rows, width="stretch")
 else:
     st.caption("Embed, extract, scan, and clean actions are recorded here.")
